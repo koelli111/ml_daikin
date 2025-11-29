@@ -1,0 +1,236 @@
+input_number:
+  daikin_setpoint:
+    name: Daikin setpoint (°C)
+    min: 15
+    max: 25
+    step: 0.1
+    unit_of_measurement: "°C"
+
+  daikin_icing_cap:
+    name: Daikin Icing Cap (%)
+    min: 30
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+
+  daikin_kp:
+    name: Kp (% per °C)
+    min: 1
+    max: 40
+    step: 1
+    unit_of_measurement: "%"
+
+  daikin_kd:
+    name: Kd (% per °C/h)
+    min: 0
+    max: 80
+    step: 2
+    unit_of_measurement: "%"
+
+  daikin_load_gain:
+    name: Load gain (% per Δ°C_out)
+    min: 0
+    max: 8
+    step: 0.2
+    unit_of_measurement: "%"
+
+  daikin_forecast_weight:
+    name: Forecast weight (0..1)
+    min: 0.0
+    max: 1.0
+    step: 0.1
+    mode: slider
+
+  daikin_base:
+    name: Base demand (%)
+    min: 30
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+
+  daikin_step_limit:
+    name: Max muutos / sykli (%)
+    min: 1
+    max: 30
+    step: 1
+    unit_of_measurement: "%"
+
+  daikin_base_learn_rate:
+    name: Base learn rate
+    min: 0.0
+    max: 0.5
+    step: 0.05
+    mode: box
+
+  daikin_deadband:
+    name: Deadband (°C)
+    min: 0.0
+    max: 0.5
+    step: 0.05
+
+template:
+
+  - sensor:
+      - name: "Daikin ML context"
+        unique_id: daikin_ml_context
+        state: >
+          {% set t = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+          {% if t is not none %}
+            {{ (t | round(0)) | int }}
+          {% else %}
+            unknown
+          {% endif %}
+
+      - name: "Daikin ML theta 0"
+        unique_id: daikin_ml_theta_0
+        state: >
+          {% set tb = state_attr('pyscript.daikin_ml_params', 'theta_by_ctx') %}
+          {% set t = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+          {% if tb is not none and t is not none %}
+            {% set ctx = ((t | round(0)) | int) | string %}
+            {% set th = tb.get(ctx) %}
+            {% if th is not none and th | length >= 1 %}
+              {{ th[0] }}
+            {% else %}
+              0
+            {% endif %}
+          {% else %}
+            0
+          {% endif %}
+        attributes:
+          context: >
+            {% set t = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+            {% if t is not none %}
+              {{ (t | round(0)) | int }}
+            {% else %}
+              unknown
+            {% endif %}
+
+      - name: "Daikin ML theta 1"
+        unique_id: daikin_ml_theta_1
+        state: >
+          {% set tb = state_attr('pyscript.daikin_ml_params', 'theta_by_ctx') %}
+          {% set t = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+          {% if tb is not none and t is not none %}
+            {% set ctx = ((t | round(0)) | int) | string %}
+            {% set th = tb.get(ctx) %}
+            {% if th is not none and th | length >= 2 %}
+              {{ th[1] }}
+            {% else %}
+              0
+            {% endif %}
+          {% else %}
+            0
+          {% endif %}
+        attributes:
+          context: >
+            {% set t = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+            {% if t is not none %}
+              {{ (t | round(0)) | int }}
+            {% else %}
+              unknown
+            {% endif %}
+
+      - name: "Daikin ML theta 2"
+        unique_id: daikin_ml_theta_2
+        state: >
+          {% set tb = state_attr('pyscript.daikin_ml_params', 'theta_by_ctx') %}
+          {% set t = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+          {% if tb is not none and t is not none %}
+            {% set ctx = ((t | round(0)) | int) | string %}
+            {% set th = tb.get(ctx) %}
+            {% if th is not none and th | length >= 3 %}
+              {{ th[2] }}
+            {% else %}
+              0
+            {% endif %}
+          {% else %}
+            0
+          {% endif %}
+        attributes:
+          context: >
+            {% set t = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+            {% if t is not none %}
+              {{ (t | round(0)) | int }}
+            {% else %}
+              unknown
+            {% endif %}
+
+      - name: "Daikin ML theta 3"
+        unique_id: daikin_ml_theta_3
+        state: >
+          {% set tb = state_attr('pyscript.daikin_ml_params', 'theta_by_ctx') %}
+          {% set t = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+          {% if tb is not none and t is not none %}
+            {% set ctx = ((t | round(0)) | int) | string %}
+            {% set th = tb.get(ctx) %}
+            {% if th is not none and th | length >= 4 %}
+              {{ th[3] }}
+            {% else %}
+              0
+            {% endif %}
+          {% else %}
+            0
+          {% endif %}
+        attributes:
+          context: >
+            {% set t = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+            {% if t is not none %}
+              {{ (t | round(0)) | int }}
+            {% else %}
+              unknown
+            {% endif %}
+
+      - name: "Daikin ML learned demand"
+        unique_id: daikin_ml_learned_demand
+        unit_of_measurement: "%"
+        state: >
+          {% set tb = state_attr('pyscript.daikin_ml_params', 'theta_by_ctx') %}
+          {% set t_out = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+          {% set sp = states('input_number.daikin_setpoint') | float(22.5) %}
+          {% if tb is not none and t_out is not none %}
+            {# sama 0,1 °C bucketointi kuin daikin_ml.py:ssä #}
+            {% set bucket = ((t_out * 10) | round(0) / 10) %}
+            {% set ctx = '{:.1f}'.format(bucket) %}
+            {% set th = tb.get(ctx) %}
+            {% if th is not none and th | length >= 4 %}
+              {% set t0 = th[0] | float %}
+              {% set t2 = th[2] | float %}
+              {% set t3 = th[3] | float %}
+              {# Jos gain eli t2 on liian pieni, ei uskalleta laskea mitään järkevää #}
+              {% if (t2 | abs) < 0.001 %}
+                unknown
+              {% else %}
+                {# Tasapaino-olettama: Tin ≈ SP, Tout ≈ t_out #}
+                {% set num = -(t0 + t3 * (t_out - sp)) %}
+                {% set d = num / t2 * 100.0 %}
+                {# Rajataan järkeviin rajoihin, esim. 30–100 % #}
+                {% set d_clamped = [ [d, 100] | min, 30 ] | max %}
+                {{ d_clamped | round(1) }}
+              {% endif %}
+            {% else %}
+              unknown
+            {% endif %}
+          {% else %}
+            unknown
+          {% endif %}
+        attributes:
+          context: >
+            {% set t_out = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+            {% if t_out is not none %}
+              {% set bucket = ((t_out * 10) | round(0) / 10) %}
+              {{ '{:.1f}'.format(bucket) }}
+            {% else %}
+              unknown
+            {% endif %}
+          theta: >
+            {% set tb = state_attr('pyscript.daikin_ml_params', 'theta_by_ctx') %}
+            {% set t_out = states('sensor.iv_tulo_lampotila') | float(default=none) %}
+            {% if tb is not none and t_out is not none %}
+              {% set bucket = ((t_out * 10) | round(0) / 10) %}
+              {% set ctx = '{:.1f}'.format(bucket) %}
+              {% set th = tb.get(ctx) %}
+              {{ th if th is not none else 'none' }}
+            {% else %}
+              none
+            {% endif %}
