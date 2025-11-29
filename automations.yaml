@@ -1,0 +1,144 @@
+- id: daikin_ml_cap_guard_icing_band
+  alias: Daikin ML Cap Guard
+  mode: single
+  trigger:
+  - platform: state
+    entity_id: select.faikin_demand_control
+  condition:
+  - condition: template
+    value_template: '{% set from_val = trigger.from_state.state | replace(''%'','''')
+      | float(0) %} {% set to_val   = trigger.to_state.state   | replace(''%'','''')
+      | float(0) %} {% set outdoor  = states(''sensor.iv_tulo_lampotila'') | float(0)
+      %} {% set cap      = states(''input_number.daikin_icing_cap'') | float(80) %}
+      {{ -2 <= outdoor <= 4 and from_val > cap and to_val <= cap }}
+
+      '
+  action:
+  - variables:
+      outdoor: '{{ states(''sensor.iv_tulo_lampotila'') | float(0) }}'
+      cap_helper: '{{ states(''input_number.daikin_icing_cap'') | float(80) }}'
+      icing_cap: "{% if -2 <= outdoor <= 4 %}\n  {{ cap_helper | round(0) }}\n{% else
+        %}\n  100\n{% endif %}"
+      is_icing: '{{ -2 <= outdoor <= 4 }}'
+  - service: logbook.log
+    data:
+      name: Daikin ML CAP GUARD
+      entity_id: select.faikin_demand_control
+      message: 'CAP GUARD: {{ trigger.from_state.state }} -> {{ trigger.to_state.state
+        }} (upper={{ icing_cap }}%, icing={{ ''ON'' if is_icing else ''OFF'' }})'
+
+- id: daikin_demand_control_p_controller_select
+  alias: Daikin demand control - P-säädin 22.5°C (select)
+  triggers:
+  - entity_id: sensor.living_room_lampotila
+    trigger: state
+  - trigger: state
+    entity_id:
+    - sensor.iv_tulo_lampotila
+  - trigger: state
+    entity_id:
+    - sensor.sisalampotila_aula
+  - event: start
+    trigger: homeassistant
+  - trigger: time_pattern
+    minutes: /5
+    enabled: false
+  conditions: []
+  actions:
+  - variables:
+      setpoint: '{{ states(''input_number.daikin_setpoint'') | float(22.5) }}'
+      kp: '{{ states(''input_number.daikin_kp'') | float(12) }}'
+      kd: '{{ states(''input_number.daikin_kd'') | float(20) }}'
+      base: '{{ states(''input_number.daikin_base'') | float(60) }}'
+      load_gain: '{{ states(''input_number.daikin_load_gain'') | float(2.0) }}'
+      fc_w: '{{ states(''input_number.daikin_forecast_weight'') | float(0.5) }}'
+      step_limit: '{{ states(''input_number.daikin_step_limit'') | float(10) }}'
+      learn_rate: '{{ states(''input_number.daikin_base_learn_rate'') | float(0.10)
+        }}'
+      deadband: '{{ states(''input_number.daikin_deadband'') | float(0.1) }}'
+      min_dem: 30
+      max_dem: 100
+      forecast_hours: 6
+      with_pct: '{{ ''%'' in (state_attr(''select.faikin_demand_control'',''options'')
+        | first | default('''')) }}'
+      temp_in: '{{ states(''sensor.living_room_lampotila'') | float(22.5) }}'
+      temp_out_now: '{{ states(''sensor.iv_tulo_lampotila'') | float(0) }}'
+      rate_in_h: '{{ states(''sensor.sisalampotila_aula'') | float(0) }}'
+      liquid: '{{ states(''sensor.faikin_liquid'') | float(100) }}'
+      defrosting: '{{ liquid < 20 }}'
+      forecast_list: '{{ state_attr(''weather.koti'',''forecast'') or [] }}'
+      future_temps: "{% set temps = [] %} {% for f in forecast_list[:forecast_hours]
+        %}\n  {% if f.temperature is defined %}\n    {% set _ = temps.append( f.temperature
+        | float ) %}\n  {% endif %}\n{% endfor %} {{ temps }}"
+      temp_out_future: "{% set tnow = temp_out_now %} {% if future_temps and future_temps|length
+        > 0 %}\n  {{ (future_temps | sum / future_temps|length) | float }}\n{% else
+        %}\n  {{ tnow }}\n{% endif %}"
+      error: '{{ (setpoint - temp_in) | float }}'
+      p_term: '{{ kp * error }}'
+      d_term: '{{ - kd * rate_in_h }}'
+      dT_out_now: '{{ (setpoint - temp_out_now) | float }}'
+      dT_out_future: '{{ (setpoint - temp_out_future) | float }}'
+      ff_now: '{{ load_gain * dT_out_now }}'
+      ff_future: '{{ load_gain * dT_out_future }}'
+      ff_mix: '{{ (1 - fc_w) * ff_now + fc_w * ff_future }}'
+      prev_str: '{{ states(''select.faikin_demand_control'') }}'
+      prev: '{{ (prev_str | replace(''%'','''')) | float(60) }}'
+      raw_dem: '{{ base + ff_mix + p_term + d_term }}'
+      dem_db: "{% if error | abs <= deadband %}\n  {{ prev }}\n{% else %}\n  {{ raw_dem
+        }}\n{% endif %}"
+      dem_step: "{% set diff = dem_db - prev %} {% if diff > step_limit %}\n  {{ prev
+        + step_limit }}\n{% elif diff < -step_limit %}\n  {{ prev - step_limit }}\n{%
+        else %}\n  {{ dem_db }}\n{% endif %}"
+      dem_clip: '{{ [max_dem, [min_dem, dem_step] | max] | min }}'
+      dir: '{% if temp_in < setpoint - deadband %} 1 {% elif temp_in > setpoint +
+        deadband %} -1 {% else %} 0 {% endif %}'
+      forced_step: "{% if dir == 1 %}\n  {{ [prev + step_limit, max_dem] | min }}\n{%
+        elif dir == -1 %}\n  {{ [prev - step_limit, min_dem] | max }}\n{% else %}\n
+        \ {{ prev }}\n{% endif %}"
+      dem_mono: "{% if dir == 1 %}\n  {{ [dem_clip, forced_step] | max }}\n{% elif
+        dir == -1 %}\n  {{ [dem_clip, forced_step] | min }}\n{% else %}\n  {{ prev
+        }}\n{% endif %}"
+      target_option: "{% set opts = state_attr('select.faikin_demand_control','options')
+        or [] %} {% set nums = (opts | map('replace','%','') | map('float') | list
+        | sort) %} {% if not nums %}\n  {{ (dem_mono | round(0)) ~ ( '%' if with_pct
+        else '' ) }}\n{% elif dir == 1 %}\n  {% set pick = (nums | select('ge', dem_mono)
+        | list | first) or (nums | last) %}\n  {{ (pick | int if pick % 1 == 0 else
+        pick) ~ ( '%' if with_pct else '' ) }}\n{% elif dir == -1 %}\n  {% set pick
+        = (nums | select('le', dem_mono) | list | last) or (nums | first) %}\n  {{
+        (pick | int if pick % 1 == 0 else pick) ~ ( '%' if with_pct else '' ) }}\n{%
+        else %}\n  {{ prev_str }}\n{% endif %}"
+      should_learn: "{{ dir == 0\n   and learn_rate > 0\n   and (prev >= (min_dem
+        + 5))\n   and (prev <= (max_dem - 5))\n   and (not defrosting) }}"
+      base_new_raw: '{{ (1 - learn_rate) * base + learn_rate * prev }}'
+      base_new: '{{ [max_dem, [min_dem, base_new_raw] | max] | min | round(0) }}'
+  - choose:
+    - conditions:
+      - condition: template
+        value_template: '{{ target_option != prev_str }}'
+      sequence:
+      - target:
+          entity_id: select.faikin_demand_control
+        data:
+          option: '{{ target_option }}'
+        action: select.select_option
+  - choose:
+    - conditions:
+      - condition: template
+        value_template: '{{ should_learn and ((base_new - base) | abs >= 1) }}'
+      sequence:
+      - target:
+          entity_id: input_number.daikin_base
+        data:
+          value: '{{ base_new }}'
+        action: input_number.set_value
+  - data:
+      name: Daikin PD+FF (monotone+learn, defrost-aware)
+      message: Tin={{ temp_in }}°C, Tout={{ temp_out_now }}°C (→{{ temp_out_future
+        }}°C), err={{ error|round(2) }}, rate={{ rate_in_h|round(2) }}°C/h, FF={{
+        ff_mix|round(1) }}, Defrost={{ defrosting }} (liquid={{ liquid }}), Icing={{
+        'ON' if (temp_out_now >= -2 and temp_out_now <= 4) else 'off' }}(cap=80),
+        Prev={{ prev|round(0) }} → Raw={{ raw_dem|round(0) }} → Step={{ dem_step|round(0)
+        }} → Clip={{ dem_clip|round(0) }} → Mono={{ dem_mono|round(0) }} → Select={{
+        target_option }}
+      entity_id: select.faikin_demand_control
+    action: logbook.log
