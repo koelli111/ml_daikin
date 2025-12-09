@@ -1,8 +1,10 @@
-Online-RLS (oppiva) ohjain Daikin demand-selectille.
-Ominaisuudet:
-- min 30 %, max 100 %
-- 6h ulkoennusteen keskiarvo feed-forwardina
-- pakotettu suunta-askel (aina vähintään step_limit kohti setpointtia deadbandin ulkopuolella)
-- deadband, step-limit, monotonisuus ja selectin pykälöinti
-- oppiminen (RLS) jäädytetään defrostin aikana (sensor.faikin_liquid < 20)
-- parametrisäilö input_text.daikin_rls_params (vain theta tallennetaan, ei P)
+Online-RLS (adaptive) controller for Daikin demand-select
+Features:
+– minimum 30%, maximum 100%
+– 6-hour outdoor forecast average as feed-forward
+– forced directional step (always at least step_limit toward the setpoint when outside the deadband)
+– deadband, step limit, monotonicity, and select option snapping
+– learning (RLS) is frozen during defrost (sensor.faikin_liquid < 20)
+– parameter storage in a persistent STORE_ENTITY (only theta is stored, not P)
+– DYNAMIC ELECTRICITY PRICE CONTROL: sensor.day_ahead_price
+– UI-adjustable settings: electricity-price sensitivity, min/max scaling factor, maximum setpoint drop
