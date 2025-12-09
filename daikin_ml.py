@@ -7,7 +7,8 @@
 # - deadband, step-limit, monotonisuus ja selectin pykälöinti
 # - oppiminen (RLS) jäädytetään defrostin aikana (sensor.faikin_liquid < 20)
 # - parametrisäilö pysyvässä STORE_ENTITY-entiteetissä (vain theta tallennetaan, ei P)
-# - PÖRSSISÄHKÖOHJAUS: sensor.day_ahead_price -> price_factor, joka skaalasi ML-optimia
+# - PÖRSSISÄHKÖOHJAUS: sensor.day_ahead_price
+# - UI-säädöt: pörssisähkön herkkyys, min/max-kerroin, max setpoint-drop
 
 import json
 import time
@@ -20,7 +21,7 @@ INDOOR_RATE = "sensor.sisalampotila_aula"        # derivaatta (°C/h)
 OUTDOOR     = "sensor.iv_tulo_lampotila"         # ulkolämpötila
 WEATHER     = "weather.koti"                     # weather.* josta forecast-attribuutti
 SELECT      = "select.faikin_demand_control"     # Daikin demand-select
-LIQUID      = "sensor.faikin_liquid"            # defrost-indikaattori
+LIQUID      = "sensor.faikin_liquid"             # defrost-indikaattori
 
 SP_HELPER         = "input_number.daikin_setpoint"
 STEP_LIMIT_HELPER = "input_number.daikin_step_limit"
@@ -28,6 +29,13 @@ DEADBAND_HELPER   = "input_number.daikin_deadband"
 
 # Icing cap helper
 ICING_CAP_HELPER = "input_number.daikin_icing_cap"
+
+# Pörssisähkö-ohjauksen helperit:
+PRICE_SENS_HELPER = "input_number.daikin_price_sensitivity"
+PRICE_FMIN_HELPER = "input_number.daikin_price_factor_min"
+PRICE_FMAX_HELPER = "input_number.daikin_price_factor_max"
+# Maksimi setpoint-alennus (°C) kalleimpana hetkenä
+PRICE_SP_DROP_HELPER = "input_number.daikin_price_sp_drop_max"
 
 # ML-oppien pysyvä storage
 STORE_ENTITY = "pyscript.daikin_ml_params"
@@ -38,7 +46,7 @@ LEARNED_SENSOR = "sensor.daikin_ml_learned_demand"
 # Pörssisähkö-sensori (day-ahead, varttihinnoittelu)
 PRICE_SENSOR = "sensor.day_ahead_price"
 
-# ---------- SÄÄTÖNUPIT ----------
+# ---------- SÄÄTÖNUPIT (oletukset, jos helper puuttuu) ----------
 HORIZON_H  = 1.0
 FORECAST_H = 6
 LAMBDA     = 0.995
@@ -64,12 +72,26 @@ AUTO_DB_MIN    = 0.05
 AUTO_DB_MAX    = 0.50
 AUTO_DB_BASE   = 0.10
 
-# Pörssisähkö–tuning:
-# PRICE_SENSITIVITY = 0   => ei vaikutusta
-# PRICE_SENSITIVITY = 0.4 => kalleimpina hetkinä demand ≈ 60 % ML-optista
-PRICE_SENSITIVITY = 0.4
-PRICE_FACTOR_MIN  = 0.5   # pienin sallittu kerroin
-PRICE_FACTOR_MAX  = 1.0   # suurin (ei nosteta yli ML-optimin)
+# Pörssisähkön oletukset (käytetään jos helper-arvo ei kelpaa)
+PRICE_SENSITIVITY_DEFAULT = 0.4   # 0–1
+PRICE_FACTOR_MIN_DEFAULT  = 0.5   # 0–1
+PRICE_FACTOR_MAX_DEFAULT  = 1.0   # 0–1
+PRICE_SP_DROP_MAX_DEFAULT = 1.5   # °C, maksimi SP-alennus kalleimpana hetkenä
+
+# ---------- Apufunktio: turvallinen float-muunnos ----------
+def _safe_float(val, default):
+    """
+    Palauttaa float(val) tai default, jos val on None / 'unknown' / 'unavailable' tms.
+    """
+    try:
+        if val is None:
+            return default
+        s = str(val).strip().lower()
+        if s in ("unknown", "unavailable", "none", "nan", ""):
+            return default
+        return float(val)
+    except Exception:
+        return default
 
 # ---------- Konteksti per ulkolämpöaste 1.0°C ----------
 def _context_key_for_outdoor(Tout: float) -> str:
@@ -188,7 +210,7 @@ def _matscale(A, s):
 
 def _rls_update(theta, P, x, y, lam=LAMBDA):
     """
-    Korjattu RLS-päivitys 4-parametriselle thetalle ja 4x4 P:lle:
+    RLS-päivitys 4-parametriselle thetalle ja 4x4 P:lle:
 
         Px    = P x
         denom = λ + x^T P x
@@ -196,8 +218,8 @@ def _rls_update(theta, P, x, y, lam=LAMBDA):
         θ_new = θ_old + K (y - x^T θ_old)
         P_new = (P - Px Px^T / denom) / λ
 
-    Lisäksi: jos päivityksen jälkeen theta/P eivät ole finiittejä, resetoidaan konteksti.
-    Ei käytetä generaattorilausekkeita (Pyscript rajoite).
+    Jos päivityksen jälkeen theta/P eivät ole finiittejä, resetoidaan konteksti.
+    Ei käytetä generaattoreita (Pyscriptin rajoite).
     """
     Px = _matvec(P, x)
     denom = lam + _dot(x, Px)
@@ -277,7 +299,7 @@ def _avg_future_outdoor():
             s += v
         return s / float(len(temps))
     try:
-        return float(state.get(OUTDOOR) or 0.0)
+        return _safe_float(state.get(OUTDOOR), 0.0)
     except Exception:
         return 0.0
 
@@ -470,34 +492,22 @@ def daikin_ml_controller(**kwargs):
     _init_context_params_if_needed()
 
     # ---- LUE SENSORIT ----
-    try:
-        Tin = float(state.get(INDOOR))
-    except Exception:
-        Tin = float("nan")
-    try:
-        Tout_raw = float(state.get(OUTDOOR))
-    except Exception:
-        Tout_raw = float("nan")
-    try:
-        rate = float(state.get(INDOOR_RATE) or 0.0)
-    except Exception:
-        rate = 0.0
+    Tin      = _safe_float(state.get(INDOOR), float("nan"))
+    Tout_raw = _safe_float(state.get(OUTDOOR), float("nan"))
+    rate     = _safe_float(state.get(INDOOR_RATE), 0.0)
 
-    sp = float(state.get(SP_HELPER) or 22.5)
+    sp_base = _safe_float(state.get(SP_HELPER), 22.5)
 
-    step_limit_current = float(state.get(STEP_LIMIT_HELPER) or 10.0)
-    deadband_current   = float(state.get(DEADBAND_HELPER) or 0.1)
+    step_limit_current = _safe_float(state.get(STEP_LIMIT_HELPER), 10.0)
+    deadband_current   = _safe_float(state.get(DEADBAND_HELPER), 0.1)
 
     prev_str = state.get(SELECT) or ""
     try:
-        prev = float(prev_str.replace('%', ''))
+        prev = float(str(prev_str).replace('%', ''))
     except Exception:
         prev = 60.0
 
-    try:
-        liquid = float(state.get(LIQUID) or 100.0)
-    except Exception:
-        liquid = 100.0
+    liquid = _safe_float(state.get(LIQUID), 100.0)
     defrosting = (liquid < 10.0)
 
     # ---- DEFROST / COOLDOWN ----
@@ -537,10 +547,7 @@ def daikin_ml_controller(**kwargs):
     else:
         global_upper = GLOBAL_MILD_MAX
 
-    try:
-        icing_cap = float(state.get(ICING_CAP_HELPER) or ICING_BAND_CAP_DEFAULT)
-    except Exception:
-        icing_cap = ICING_BAND_CAP_DEFAULT
+    icing_cap = _safe_float(state.get(ICING_CAP_HELPER), ICING_BAND_CAP_DEFAULT)
     icing_cap = _clip(icing_cap, MIN_DEM, MAX_DEM)
 
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
@@ -563,8 +570,63 @@ def daikin_ml_controller(**kwargs):
 
     prev_eff = prev if prev <= band_upper else band_upper
 
+    # ---- PÖRSSISÄHKÖ: parametrit & hinta ----
+    price_sens = _safe_float(state.get(PRICE_SENS_HELPER), PRICE_SENSITIVITY_DEFAULT)
+    if price_sens < 0.0:
+        price_sens = 0.0
+    if price_sens > 1.0:
+        price_sens = 1.0
+
+    pf_min = _safe_float(state.get(PRICE_FMIN_HELPER), PRICE_FACTOR_MIN_DEFAULT)
+    if pf_min < 0.0:
+        pf_min = 0.0
+    if pf_min > 1.0:
+        pf_min = 1.0
+
+    pf_max = _safe_float(state.get(PRICE_FMAX_HELPER), PRICE_FACTOR_MAX_DEFAULT)
+    if pf_max < 0.0:
+        pf_max = 0.0
+    if pf_max > 1.0:
+        pf_max = 1.0
+
+    if pf_max < pf_min:
+        pf_max = pf_min
+
+    # max setpoint-drop
+    sp_drop_max = _safe_float(state.get(PRICE_SP_DROP_HELPER), PRICE_SP_DROP_MAX_DEFAULT)
+    if sp_drop_max < 0.0:
+        sp_drop_max = 0.0
+    if sp_drop_max > 5.0:
+        sp_drop_max = 5.0
+
+    price_now, price_min, price_max = _get_price_info()
+    price_factor = 1.0
+    price_norm = None
+
+    if (price_now is not None) and (price_min is not None) and (price_max is not None):
+        diff_range = price_max - price_min
+        if diff_range > 0.0:
+            price_norm = (price_now - price_min) / diff_range
+            if price_norm < 0.0:
+                price_norm = 0.0
+            if price_norm > 1.0:
+                price_norm = 1.0
+            price_factor = 1.0 - price_sens * price_norm
+            if price_factor < pf_min:
+                price_factor = pf_min
+            if price_factor > pf_max:
+                price_factor = pf_max
+
+    # ---- HINNAN MUKAINEN SETPOINTIN ALEMMAKS NOSTO ----
+    price_sp_delta = 0.0
+    if price_norm is not None:
+        # mitä korkeampi hinta ja mitä suurempi price_sens, sitä enemmän pudotetaan SP:tä
+        price_sp_delta = sp_drop_max * price_sens * price_norm
+
+    sp_eff = sp_base - price_sp_delta
+
     # ---- RLS-OPPIMINEN ----
-    err         = sp - Tin
+    err         = sp_eff - Tin
     demand_norm = _clip(prev_eff / 100.0, 0.0, 1.0)
     x = [1.0, err, demand_norm, (Tout_raw - Tin)]
     y = rate
@@ -598,25 +660,7 @@ def daikin_ml_controller(**kwargs):
 
     dem_opt = _clip((num / (denom_mag * denom_sign)) * 100.0, 0.0, 100.0)
 
-    # ---- PÖRSSISÄHKÖ: price_factor 0.5–1.0 ----
-    price_now, price_min, price_max = _get_price_info()
-    price_factor = 1.0
-    price_norm = None
-
-    if (price_now is not None) and (price_min is not None) and (price_max is not None):
-        diff_range = price_max - price_min
-        if diff_range > 0.0:
-            price_norm = (price_now - price_min) / diff_range
-            if price_norm < 0.0:
-                price_norm = 0.0
-            if price_norm > 1.0:
-                price_norm = 1.0
-            price_factor = 1.0 - PRICE_SENSITIVITY * price_norm
-            if price_factor < PRICE_FACTOR_MIN:
-                price_factor = PRICE_FACTOR_MIN
-            if price_factor > PRICE_FACTOR_MAX:
-                price_factor = PRICE_FACTOR_MAX
-
+    # ---- PÖRSSI-SKAALAUS ML-OPTIMILLE ----
     dem_price_raw = dem_opt * price_factor
 
     # ---- DEAD BAND / HINTA → dem_target (ennen steppejä/cappeja) ----
@@ -645,8 +689,17 @@ def daikin_ml_controller(**kwargs):
         if -delta > down_limit:
             dem_target = prev_eff - down_limit
 
-    # Klippi globaaleilla ja icing-capeilla
+    # ---- KLIPPI + ERILLINEN HINTA-CAP ----
     dem_clip = _clip(dem_target, MIN_DEM, band_upper)
+
+    price_cap_demand = None
+    if price_norm is not None:
+        # price_sens 0 → ei rajoitusta, 1 → kalleimmillaan cap = MIN_DEM
+        price_cap_demand = MIN_DEM + (band_upper - MIN_DEM) * (1.0 - price_sens * price_norm)
+        if price_cap_demand < band_upper and dem_clip > price_cap_demand:
+            dem_clip = price_cap_demand
+        dem_clip = _clip(dem_clip, MIN_DEM, band_upper)
+
     option = _snap_to_select(dem_clip, 0)
 
     # ---- PÄIVITÄ ML LEARNED DEMAND -SENSORI ----
@@ -664,7 +717,9 @@ def daikin_ml_controller(**kwargs):
             ctx=ctx,
             outdoor_bucket=Tout_bucket,
             outdoor=round(Tout_raw, 1),
-            setpoint=round(sp, 2),
+            setpoint_base=round(sp_base, 2),
+            setpoint_effective=round(sp_eff, 2),
+            setpoint_drop=round(price_sp_delta, 2),
             indoor=round(Tin, 2),
             defrosting=defrosting,
             cooldown=in_cooldown,
@@ -672,6 +727,12 @@ def daikin_ml_controller(**kwargs):
             price_min=price_min,
             price_max=price_max,
             price_factor=round(price_factor, 3),
+            price_sensitivity=round(price_sens, 3),
+            price_factor_min=round(pf_min, 3),
+            price_factor_max=round(pf_max, 3),
+            price_norm=price_norm,
+            price_cap_demand=round(price_cap_demand, 1) if price_cap_demand is not None else None,
+            sp_drop_max=round(sp_drop_max, 2),
             dem_opt_raw=round(dem_opt, 1),
             dem_price_raw=round(dem_price_raw, 1),
             dem_target_pre_clip=round(dem_target_pre_clip, 1),
@@ -706,38 +767,39 @@ def daikin_ml_controller(**kwargs):
     log.info(
         "Daikin ML: ctx=%s | Tin=%.2f°C, Tout=%.2f°C (bucket=%d, →%.1f°C), "
         "DEFROST=%s, cooldown=%s, icing_band=%s, band_upper=%.0f%%, theta=%s | "
-        "SP=%.2f, step_limit=%.1f, deadband=%.2f | "
-        "price=%.3f, pf=%.2f | "
+        "SP_base=%.2f, SP_eff=%.2f, SP_drop=%.2f, step_limit=%.1f, deadband=%.2f | "
+        "price=%.3f, pf=%.2f (sens=%.2f, fmin=%.2f, fmax=%.2f, spdrop_max=%.2f) | "
+        "price_cap≈%s | "
         "prev=%s → opt≈%.0f%% → price≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s",
         ctx, Tin, Tout_raw, Tout_bucket, Tout_future,
         str(defrosting), cool_str, icing_str, band_upper, theta_str,
-        sp, step_limit, deadband,
-        price_now_log, price_factor,
+        sp_base, sp_eff, price_sp_delta, step_limit, deadband,
+        price_now_log, price_factor, price_sens, pf_min, pf_max, sp_drop_max,
+        str(round(price_cap_demand, 1)) if price_cap_demand is not None else "none",
         prev_str, dem_opt, dem_price_raw, dem_target, dem_clip, option,
     )
 
 # ---------- CAP-VARTIJA ----------
 @state_trigger(f"{SELECT}")
 def daikin_ml_cap_guard(value=None, **kwargs):
-    try:
-        Tout_raw = float(state.get(OUTDOOR))
-    except Exception:
+    Tout_raw = _safe_float(state.get(OUTDOOR), None)
+    if Tout_raw is None or not isfinite(Tout_raw):
         return
     Tout_bucket = int(round(Tout_raw))
     if Tout_bucket <= -5:
         global_upper = MAX_DEM
     else:
         global_upper = GLOBAL_MILD_MAX
-    try:
-        icing_cap = float(state.get(ICING_CAP_HELPER) or ICING_BAND_CAP_DEFAULT)
-    except Exception:
-        icing_cap = ICING_BAND_CAP_DEFAULT
+
+    icing_cap = _safe_float(state.get(ICING_CAP_HELPER), ICING_BAND_CAP_DEFAULT)
     icing_cap = _clip(icing_cap, MIN_DEM, MAX_DEM)
+
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
     if in_icing_band:
         band_upper = icing_cap if icing_cap < global_upper else global_upper
     else:
         band_upper = global_upper
+
     curr_str = state.get(SELECT) or ""
     try:
         curr = float(str(curr_str).replace('%', ''))
