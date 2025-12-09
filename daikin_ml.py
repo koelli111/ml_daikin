@@ -6,34 +6,27 @@
 # - pakotettu suunta-askel (aina vähintään step_limit kohti setpointtia deadbandin ulkopuolella)
 # - deadband, step-limit, monotonisuus ja selectin pykälöinti
 # - oppiminen (RLS) jäädytetään defrostin aikana (sensor.faikin_liquid < 20)
-# - parametrisäilö input_text.daikin_rls_params (vain theta tallennetaan, ei P)
-#
-# VAIHDA NÄMÄ ENTITYT:
-#   INDOOR  = "sensor.home_temp"                 # sisälämpötila
-#   OUTDOOR = "sensor.outdoor_temp"              # ulkolämpötila
-#   WEATHER = "weather.home"                     # weather.* jossa 'forecast'
-#   SELECT  = "select.faikin_demand_control"     # Daikin demand-select
-#   LIQUID  = "sensor.faikin_liquid"             # defrost-indikaattori (alle 20 = defrost)
-#   INDOOR_RATE, SP_HELPER, STEP_LIMIT_HELPER, DEADBAND_HELPER, PARAMS_TXT: ks. alta
+# - parametrisäilö pysyvässä STORE_ENTITY-entiteetissä (vain theta tallennetaan, ei P)
+# - PÖRSSISÄHKÖOHJAUS: sensor.day_ahead_price -> price_factor, joka skaalasi ML-optimia
 
 import json
 import time
 from math import isfinite
+from datetime import datetime
 
 # --------- ENTITYT (VAIHDA OMIKSI) ----------
-INDOOR = "sensor.living_room_lampotila"                 # <-- sisälämpötila
-INDOOR_RATE = "sensor.sisalampotila_aula"  # derivative-sensori (°C/h)
-OUTDOOR = "sensor.iv_tulo_lampotila"             # <-- ulkolämpötila
-WEATHER = "weather.koti"                    # <-- weather.* josta forecast-attribuutti
-SELECT = "select.faikin_demand_control"     # <-- Daikinin demand-select
-LIQUID = "sensor.faikin_liquid"             # <-- defrost-indikaattori
+INDOOR      = "sensor.living_room_lampotila"     # sisälämpötila
+INDOOR_RATE = "sensor.sisalampotila_aula"        # derivaatta (°C/h)
+OUTDOOR     = "sensor.iv_tulo_lampotila"         # ulkolämpötila
+WEATHER     = "weather.koti"                     # weather.* josta forecast-attribuutti
+SELECT      = "select.faikin_demand_control"     # Daikin demand-select
+LIQUID      = "sensor.faikin_liquid"            # defrost-indikaattori
 
-
-SP_HELPER = "input_number.daikin_setpoint"
+SP_HELPER         = "input_number.daikin_setpoint"
 STEP_LIMIT_HELPER = "input_number.daikin_step_limit"
-DEADBAND_HELPER = "input_number.daikin_deadband"
+DEADBAND_HELPER   = "input_number.daikin_deadband"
 
-# UUSI: icing cap helper
+# Icing cap helper
 ICING_CAP_HELPER = "input_number.daikin_icing_cap"
 
 # ML-oppien pysyvä storage
@@ -41,6 +34,9 @@ STORE_ENTITY = "pyscript.daikin_ml_params"
 
 # Learned demand -sensori
 LEARNED_SENSOR = "sensor.daikin_ml_learned_demand"
+
+# Pörssisähkö-sensori (day-ahead, varttihinnoittelu)
+PRICE_SENSOR = "sensor.day_ahead_price"
 
 # ---------- SÄÄTÖNUPIT ----------
 HORIZON_H  = 1.0
@@ -68,6 +64,13 @@ AUTO_DB_MIN    = 0.05
 AUTO_DB_MAX    = 0.50
 AUTO_DB_BASE   = 0.10
 
+# Pörssisähkö–tuning:
+# PRICE_SENSITIVITY = 0   => ei vaikutusta
+# PRICE_SENSITIVITY = 0.4 => kalleimpina hetkinä demand ≈ 60 % ML-optista
+PRICE_SENSITIVITY = 0.4
+PRICE_FACTOR_MIN  = 0.5   # pienin sallittu kerroin
+PRICE_FACTOR_MAX  = 1.0   # suurin (ei nosteta yli ML-optimin)
+
 # ---------- Konteksti per ulkolämpöaste 1.0°C ----------
 def _context_key_for_outdoor(Tout: float) -> str:
     if not isfinite(Tout):
@@ -94,8 +97,22 @@ def _load_params_from_store():
         for key, val in tb.items():
             if isinstance(val, (list, tuple)) and len(val) == 4:
                 try:
-                    th = [float(val[0]), float(val[1]), float(val[2]), float(val[3])]
-                    new[str(key)] = th
+                    th0 = float(val[0])
+                    th1 = float(val[1])
+                    th2 = float(val[2])
+                    th3 = float(val[3])
+                    ok = True
+                    for t in (th0, th1, th2, th3):
+                        if not isfinite(t):
+                            ok = False
+                            break
+                    if ok:
+                        new[str(key)] = [th0, th1, th2, th3]
+                    else:
+                        log.warning(
+                            "Daikin ML: dropping non-finite stored theta for ctx=%s: %s",
+                            key, val,
+                        )
                 except Exception:
                     continue
     if new:
@@ -170,22 +187,73 @@ def _matscale(A, s):
     return C
 
 def _rls_update(theta, P, x, y, lam=LAMBDA):
+    """
+    Korjattu RLS-päivitys 4-parametriselle thetalle ja 4x4 P:lle:
+
+        Px    = P x
+        denom = λ + x^T P x
+        K     = Px / denom
+        θ_new = θ_old + K (y - x^T θ_old)
+        P_new = (P - Px Px^T / denom) / λ
+
+    Lisäksi: jos päivityksen jälkeen theta/P eivät ole finiittejä, resetoidaan konteksti.
+    Ei käytetä generaattorilausekkeita (Pyscript rajoite).
+    """
     Px = _matvec(P, x)
     denom = lam + _dot(x, Px)
-    if denom == 0:
-        denom = 1e-6
-    K = [v / denom for v in Px]
+
+    if (not isfinite(denom)) or denom == 0.0:
+        log.warning("Daikin ML: RLS denom not finite (%.6g), skipping update", denom)
+        return theta, P
+
+    gain = 1.0 / denom
     err_est = y - _dot(x, theta)
-    theta = [theta[0] + K[0] * err_est,
-             theta[1] + K[1] * err_est,
-             theta[2] + K[2] * err_est,
-             theta[3] + K[3] * err_est]
-    xTP = [[0.0] * 4 for _ in range(4)]
+
+    theta = [
+        theta[0] + Px[0] * gain * err_est,
+        theta[1] + Px[1] * gain * err_est,
+        theta[2] + Px[2] * gain * err_est,
+        theta[3] + Px[3] * gain * err_est,
+    ]
+
+    Px_outer = [[0.0] * 4 for _ in range(4)]
     for i in range(4):
         for j in range(4):
-            xTP[i][j] = x[i] * Px[j]
-    P = _matscale(_matsub(P, xTP), 1.0 / lam)
+            Px_outer[i][j] = Px[i] * Px[j] * gain
+
+    P = _matscale(_matsub(P, Px_outer), 1.0 / lam)
+
+    # Tarkistetaan, että theta ja P ovat finiittejä
+    all_ok = True
+    for t in theta:
+        if not isfinite(t):
+            all_ok = False
+            break
+    if all_ok:
+        for i in range(4):
+            for j in range(4):
+                if not isfinite(P[i][j]):
+                    all_ok = False
+                    break
+            if not all_ok:
+                break
+
+    if not all_ok:
+        log.warning("Daikin ML: RLS produced non-finite theta/P, resetting this context")
+        theta = [0.0, 0.0, 5.0, 0.0]
+        P = [[P0, 0, 0, 0],
+             [0, P0, 0, 0],
+             [0, 0, P0, 0],
+             [0, 0, 0, P0]]
+
     return theta, P
+
+def _clip(v, lo, hi):
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
 
 # ---------- Sääennuste ----------
 def _avg_future_outdoor():
@@ -212,6 +280,75 @@ def _avg_future_outdoor():
         return float(state.get(OUTDOOR) or 0.0)
     except Exception:
         return 0.0
+
+# ---------- Pörssisähkö: haetaan nykyinen hinta ja päivän min/max ----------
+def _get_price_info():
+    """
+    Palauttaa (price_now, price_min, price_max) sensor.day_ahead_price -sensorista.
+    Käyttää attributes['records'] -listaa, jossa on Time, End, Price.
+    Jos jotain ei löydy, palauttaa (None, None, None).
+    """
+    try:
+        attrs = state.getattr(PRICE_SENSOR) or {}
+    except Exception:
+        return None, None, None
+
+    recs = attrs.get("records")
+    if not isinstance(recs, list) or len(recs) == 0:
+        return None, None, None
+
+    price_min = None
+    price_max = None
+    price_now = None
+
+    now_naive = datetime.now()
+
+    for rec in recs:
+        price_raw = rec.get("Price")
+        try:
+            p = float(price_raw)
+        except Exception:
+            continue
+
+        if price_min is None or p < price_min:
+            price_min = p
+        if price_max is None or p > price_max:
+            price_max = p
+
+        # Yritetään päätellä nykyinen vartti
+        t_str = rec.get("Time")
+        e_str = rec.get("End")
+        if t_str is not None:
+            try:
+                t0 = datetime.fromisoformat(str(t_str))
+            except Exception:
+                t0 = None
+            if e_str is not None:
+                try:
+                    t1 = datetime.fromisoformat(str(e_str))
+                except Exception:
+                    t1 = None
+            else:
+                t1 = None
+
+            if t0 is not None:
+                if t0.tzinfo is not None:
+                    now_cmp = datetime.now(t0.tzinfo)
+                else:
+                    now_cmp = now_naive
+
+                in_interval = False
+                if t1 is not None:
+                    if (t0 <= now_cmp) and (now_cmp < t1):
+                        in_interval = True
+                else:
+                    if t0 <= now_cmp:
+                        in_interval = True
+
+                if in_interval:
+                    price_now = p
+
+    return price_now, price_min, price_max
 
 # ---------- Selectin optiot ----------
 def _with_pct():
@@ -273,13 +410,6 @@ def _snap_to_select(value, direction):
         picked = int(picked)
     return str(picked) + ('%' if has_pct else '')
 
-def _clip(v, lo, hi):
-    if v < lo:
-        return lo
-    if v > hi:
-        return hi
-    return v
-
 # ---------- AUTO-TUNING ----------
 def _auto_tune_helpers(theta, ctx, step_limit_current, deadband_current):
     try:
@@ -317,7 +447,7 @@ def _ml_startup_ok():
             LEARNED_SENSOR,
             value=0.0,
             ctx="init",
-            note="raw ML demand (dem_opt) before caps/step/cooldown"
+            note="ML+price demand (dem_clip) before select snapping",
         )
     except Exception as e:
         log.error("Daikin ML: failed to init learned demand sensor: %s", e)
@@ -339,6 +469,7 @@ def daikin_ml_controller(**kwargs):
 
     _init_context_params_if_needed()
 
+    # ---- LUE SENSORIT ----
     try:
         Tin = float(state.get(INDOOR))
     except Exception:
@@ -357,7 +488,7 @@ def daikin_ml_controller(**kwargs):
     step_limit_current = float(state.get(STEP_LIMIT_HELPER) or 10.0)
     deadband_current   = float(state.get(DEADBAND_HELPER) or 0.1)
 
-    prev_str   = state.get(SELECT) or ""
+    prev_str = state.get(SELECT) or ""
     try:
         prev = float(prev_str.replace('%', ''))
     except Exception:
@@ -367,8 +498,9 @@ def daikin_ml_controller(**kwargs):
         liquid = float(state.get(LIQUID) or 100.0)
     except Exception:
         liquid = 100.0
-    defrosting = (liquid < 20.0)
+    defrosting = (liquid < 10.0)
 
+    # ---- DEFROST / COOLDOWN ----
     now = time.time()
     if _last_defrosting is None:
         _last_defrosting = defrosting
@@ -382,6 +514,7 @@ def daikin_ml_controller(**kwargs):
         log.info("Daikin ML: sensors not ready; Tin=%s Tout=%s", state.get(INDOOR), state.get(OUTDOOR))
         return
 
+    # ---- KONTEXTI ----
     Tout_bucket = int(round(Tout_raw))
     ctx = _context_key_for_outdoor(Tout_raw)
 
@@ -398,13 +531,12 @@ def daikin_ml_controller(**kwargs):
 
     step_limit, deadband = _auto_tune_helpers(theta, ctx, step_limit_current, deadband_current)
 
-    # Globaali max bucketin perusteella
+    # ---- CAP-BUCKETIT / ICING ----
     if Tout_bucket <= -5:
         global_upper = MAX_DEM
     else:
         global_upper = GLOBAL_MILD_MAX
 
-    # Icing band
     try:
         icing_cap = float(state.get(ICING_CAP_HELPER) or ICING_BAND_CAP_DEFAULT)
     except Exception:
@@ -414,7 +546,7 @@ def daikin_ml_controller(**kwargs):
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
 
     if in_icing_band:
-        band_upper = min(global_upper, icing_cap)
+        band_upper = icing_cap if icing_cap < global_upper else global_upper
     else:
         band_upper = global_upper
 
@@ -431,6 +563,7 @@ def daikin_ml_controller(**kwargs):
 
     prev_eff = prev if prev <= band_upper else band_upper
 
+    # ---- RLS-OPPIMINEN ----
     err         = sp - Tin
     demand_norm = _clip(prev_eff / 100.0, 0.0, 1.0)
     x = [1.0, err, demand_norm, (Tout_raw - Tin)]
@@ -451,6 +584,7 @@ def daikin_ml_controller(**kwargs):
             defrosting, in_cooldown, ctx,
         )
 
+    # ---- ML-OPTIMI (ilman hintaa) ----
     Tout_future = _avg_future_outdoor()
     Tout_eff    = 0.5 * Tout_raw + 0.5 * Tout_future
     dTin_target = _clip(KAPPA * err / HORIZON_H, -2.0, 2.0)
@@ -461,29 +595,37 @@ def daikin_ml_controller(**kwargs):
     denom_mag  = abs(denom_raw)
     if denom_mag < 0.5:
         denom_mag = 0.5
+
     dem_opt = _clip((num / (denom_mag * denom_sign)) * 100.0, 0.0, 100.0)
 
-    # --- PÄIVITETÄÄN LEARNED DEMAND -SENSORI (raaka ML-optimi) ---
-    try:
-        state.set(
-            LEARNED_SENSOR,
-            value=round(dem_opt, 1),
-            ctx=ctx,
-            outdoor_bucket=Tout_bucket,
-            outdoor=round(Tout_raw, 1),
-            setpoint=round(sp, 2),
-            indoor=round(Tin, 2),
-            defrosting=defrosting,
-            cooldown=in_cooldown,
-        )
-    except Exception as e:
-        log.error("Daikin ML: failed to update learned demand sensor: %s", e)
+    # ---- PÖRSSISÄHKÖ: price_factor 0.5–1.0 ----
+    price_now, price_min, price_max = _get_price_info()
+    price_factor = 1.0
+    price_norm = None
 
-    # Deadband: pidä ennallaan
+    if (price_now is not None) and (price_min is not None) and (price_max is not None):
+        diff_range = price_max - price_min
+        if diff_range > 0.0:
+            price_norm = (price_now - price_min) / diff_range
+            if price_norm < 0.0:
+                price_norm = 0.0
+            if price_norm > 1.0:
+                price_norm = 1.0
+            price_factor = 1.0 - PRICE_SENSITIVITY * price_norm
+            if price_factor < PRICE_FACTOR_MIN:
+                price_factor = PRICE_FACTOR_MIN
+            if price_factor > PRICE_FACTOR_MAX:
+                price_factor = PRICE_FACTOR_MAX
+
+    dem_price_raw = dem_opt * price_factor
+
+    # ---- DEAD BAND / HINTA → dem_target (ennen steppejä/cappeja) ----
     if abs(err) <= deadband:
-        dem_target = prev_eff
+        dem_target = prev_eff            # ei säätöä deadbandin sisällä
     else:
-        dem_target = dem_opt
+        dem_target = dem_price_raw       # ML-optimi * pörssikerroin
+
+    dem_target_pre_clip = dem_target
 
     # Monotoninen ehto: jos ollaan kylmällä puolella, demand ei saa laskea
     if err > deadband and dem_target < prev_eff:
@@ -503,9 +645,41 @@ def daikin_ml_controller(**kwargs):
         if -delta > down_limit:
             dem_target = prev_eff - down_limit
 
+    # Klippi globaaleilla ja icing-capeilla
     dem_clip = _clip(dem_target, MIN_DEM, band_upper)
     option = _snap_to_select(dem_clip, 0)
 
+    # ---- PÄIVITÄ ML LEARNED DEMAND -SENSORI ----
+    learn_value = dem_clip   # mitä ML+hintalogiikka lopulta haluaa (ennen select-pykäliä)
+
+    try:
+        if price_now is None:
+            price_now_val = None
+        else:
+            price_now_val = price_now
+
+        state.set(
+            LEARNED_SENSOR,
+            value=round(learn_value, 1),
+            ctx=ctx,
+            outdoor_bucket=Tout_bucket,
+            outdoor=round(Tout_raw, 1),
+            setpoint=round(sp, 2),
+            indoor=round(Tin, 2),
+            defrosting=defrosting,
+            cooldown=in_cooldown,
+            price_now=price_now_val,
+            price_min=price_min,
+            price_max=price_max,
+            price_factor=round(price_factor, 3),
+            dem_opt_raw=round(dem_opt, 1),
+            dem_price_raw=round(dem_price_raw, 1),
+            dem_target_pre_clip=round(dem_target_pre_clip, 1),
+        )
+    except Exception as e:
+        log.error("Daikin ML: failed to update learned demand sensor: %s", e)
+
+    # Jos select-arvo jäisi cappen yli, clampataan vielä
     try:
         opt_num = float(str(option).replace('%', ''))
     except Exception:
@@ -523,17 +697,23 @@ def daikin_ml_controller(**kwargs):
     theta_str = "[" + ", ".join([str(round(float(v), 4)) for v in theta]) + "]"
     cool_str  = "ACTIVE" if in_cooldown else "off"
     icing_str = "ON" if in_icing_band else "off"
+
+    if price_now is None:
+        price_now_log = -1.0
+    else:
+        price_now_log = price_now
+
     log.info(
         "Daikin ML: ctx=%s | Tin=%.2f°C, Tout=%.2f°C (bucket=%d, →%.1f°C), "
-        "DEFROST=%s, cooldown=%s, "
-        "icing_band=%s, band_upper=%.0f%%, theta=%s | "
+        "DEFROST=%s, cooldown=%s, icing_band=%s, band_upper=%.0f%%, theta=%s | "
         "SP=%.2f, step_limit=%.1f, deadband=%.2f | "
-        "prev=%s → opt≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s",
+        "price=%.3f, pf=%.2f | "
+        "prev=%s → opt≈%.0f%% → price≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s",
         ctx, Tin, Tout_raw, Tout_bucket, Tout_future,
-        str(defrosting), cool_str,
-        icing_str, band_upper, theta_str,
+        str(defrosting), cool_str, icing_str, band_upper, theta_str,
         sp, step_limit, deadband,
-        prev_str, dem_opt, dem_target, dem_clip, option,
+        price_now_log, price_factor,
+        prev_str, dem_opt, dem_price_raw, dem_target, dem_clip, option,
     )
 
 # ---------- CAP-VARTIJA ----------
@@ -555,7 +735,7 @@ def daikin_ml_cap_guard(value=None, **kwargs):
     icing_cap = _clip(icing_cap, MIN_DEM, MAX_DEM)
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
     if in_icing_band:
-        band_upper = min(global_upper, icing_cap)
+        band_upper = icing_cap if icing_cap < global_upper else global_upper
     else:
         band_upper = global_upper
     curr_str = state.get(SELECT) or ""
@@ -577,42 +757,9 @@ def daikin_ml_cap_guard(value=None, **kwargs):
 def daikin_ml_reset():
     """Nollaa kaikki ML-opit ja aloita alusta."""
     global _theta_by_ctx, _P_by_ctx, _params_loaded
-    old_cnt = len(_theta_by_ctx) if isinstance(_theta_by_ctx, dict) else 0
     _theta_by_ctx = {}
     _P_by_ctx = {}
     _params_loaded = False
-    try:
-        state.set(
-            STORE_ENTITY,
-            value=time.time(),
-            theta_by_ctx={},
-        )
-        log.warning(
-            "Daikin ML RESET: cleared %d learned contexts, theta_by_ctx now empty in %s",
-            old_cnt,
-            STORE_ENTITY,
-        )
-    except Exception as e:
-        log.error("Daikin ML RESET: error resetting params in %s: %s", STORE_ENTITY, e)
-
-# ---------- Käsin ajettava askel ----------
-@service
-def daikin_ml_step():
-    """Aja ohjain kerran (voi kutsua HA-automaatioista)."""
-    try:
-        daikin_ml_controller()
-    except Exception as e:
-        log.error("Daikin ML step error: %s", e)
-
-@service
-def daikin_ml_reset():
-    """Nollaa kaikki ML-opit ja aloita alusta."""
-    global _theta_by_ctx, _P_by_ctx, _params_loaded
-
-    _theta_by_ctx = {}
-    _P_by_ctx = {}
-    _params_loaded = False
-
     try:
         state.set(
             STORE_ENTITY,
@@ -622,3 +769,12 @@ def daikin_ml_reset():
         log.warning("Daikin ML: ALL LEARNED PARAMETERS RESET (theta_by_ctx cleared)")
     except Exception as e:
         log.error("Daikin ML: error resetting params in %s: %s", STORE_ENTITY, e)
+
+# ---------- Käsin ajettava askel ----------
+@service
+def daikin_ml_step():
+    """Aja ohjain kerran (voi kutsua HA-automaatioista)."""
+    try:
+        daikin_ml_controller()
+    except Exception as e:
+        log.error("Daikin ML step error: %s", e)
