@@ -1,4 +1,43 @@
 input_number:
+
+  daikin_price_sensitivity:
+    name: Daikin ML pörssisähkön herkkyys
+    min: 0.0
+    max: 1.0
+    step: 0.05
+    mode: slider
+    initial: 0.4
+    icon: mdi:cash-clock
+
+  daikin_price_factor_min:
+    name: Daikin ML pörssisähkö min kerroin
+    min: 0.0
+    max: 1.0
+    step: 0.05
+    mode: slider
+    initial: 0.5
+    icon: mdi:percent-outline
+
+  daikin_price_factor_max:
+    name: Daikin ML pörssisähkö max kerroin
+    min: 0.0
+    max: 1.0
+    step: 0.05
+    mode: slider
+    initial: 1.0
+    icon: mdi:percent
+
+  daikin_price_sp_drop_max:
+    name: Daikin ML max SP alipudotus
+    min: 0.0
+    max: 5.0
+    step: 0.1
+    mode: slider
+    unit_of_measurement: "°C"
+    initial: 1.5
+    icon: mdi:thermometer-minus
+
+
   daikin_setpoint:
     name: Daikin setpoint (°C)
     min: 15
