@@ -1,4 +1,8 @@
-Online-RLS (adaptive) controller for Daikin demand-select
+Online-RLS (adaptive) controller for Daikin demand-select.
+
+Requirements: 
+Pyscript Python scripting (HACS)
+Helpers & sensors & hardware
 
 Features:
 Demand control: minimum 30%, maximum 100%
