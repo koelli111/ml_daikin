@@ -6,3 +6,4 @@ Ominaisuudet:
 - deadband, step-limit, monotonisuus ja selectin pykälöinti
 - oppiminen (RLS) jäädytetään defrostin aikana (sensor.faikin_liquid < 20)
 - parametrisäilö input_text.daikin_rls_params (vain theta tallennetaan, ei P)
+- usean laitteen ohjausmahdollisuus
