@@ -1,22 +1,21 @@
 # pyscript/daikin_ml_multi.py
 # Online-RLS (oppiva) ohjain Daikin demand-selectille, MULTI-DAIKIN -tuella.
 #
-# ADDITIONS:
-# - Helper to switch learning on/off:
-#     * input_boolean.daikin_ml_learning_enabled (global)
-#     * optional per-unit override: input_boolean.daikin1_ml_learning_enabled, input_boolean.daikin2_ml_learning_enabled, ...
-#   Logic:
-#     - If per-unit helper exists, it takes precedence for that unit.
-#     - Otherwise global helper is used.
+# NEW: "QUIET 100" intermediate level above 95% but below real 100%
+# - If demand target is > GLOBAL_MILD_MAX (95) but < 100:
+#     -> select 100% AND turn ON QUIET_SWITCH (e.g. switch.faikin_quiet_outdoor)
+# - If demand target is >= 100:
+#     -> select 100% AND turn OFF QUIET_SWITCH (real max)
+# - If demand target <= 95:
+#     -> QUIET_SWITCH OFF (normal behavior)
+#
+# OPTION A:
+# - Learned-demand sensor updated ONLY when learning_enabled == True
 #
 # FIXES:
-# - NaN/inf-suojaukset: rate / x / y / theta / dem_opt ei voi enää korruptoitua tai mennä NaN:ksi
-# - _clip on NaN-safe
-# - _rls_update on NaN-safe (hylkää päivityksen jos jokin menee epäkelvoksi)
-# - tallennus/lataus ohittaa epäkelvot (NaN/inf) theta-arvot
-# - learned demand sensor ei koskaan saa NaN:ia (fallback prev_eff)
-#
-# MUOKKAA: DAIKINS-listaan omat entityt (yksi dict per Daikin)
+# - NaN/inf guards for rate / x / y / theta / dem_opt
+# - _clip NaN-safe, _rls_update guarded
+# - store load/save ignores non-finite thetas
 
 import time
 from math import isfinite
@@ -24,15 +23,10 @@ from math import isfinite
 # ============================================================
 # 0) LEARNING ENABLE HELPERS
 # ============================================================
-# Create these in Home Assistant:
-# - input_boolean.daikin_ml_learning_enabled   (global master switch)
-# Optionally per unit (takes precedence if exists):
-# - input_boolean.daikin1_ml_learning_enabled
-# - input_boolean.daikin2_ml_learning_enabled
 LEARNING_ENABLED_HELPER_GLOBAL = "input_boolean.daikin_ml_learning_enabled"
 
 # ============================================================
-# 1) LAITEKONFIGURAATIOT (LISÄÄ TÄHÄN UUSIA DAIKINEita)
+# 1) UNIT CONFIGS
 # ============================================================
 DAIKINS = [
     {
@@ -51,17 +45,16 @@ DAIKINS = [
         "DEADBAND_HELPER": "input_number.daikin_deadband",
         "ICING_CAP_HELPER": "input_number.daikin_icing_cap",
 
-        # Persistent store per laite (suositus: eri entity per daikin)
         "STORE_ENTITY": "pyscript.daikin1_ml_params",
-
-        # Learned-demand sensori per laite
         "LEARNED_SENSOR": "sensor.daikin1_ml_learned_demand",
 
-        # Optional per-unit learning switch (if you create it)
         "LEARNING_ENABLED_HELPER": "input_boolean.daikin1_ml_learning_enabled",
+
+        # NEW: quiet outdoor switch used to create intermediate "QUIET 100" level
+        "QUIET_SWITCH": "switch.faikin_quiet_outdoor",
     },
 
-    # Esimerkki toisesta laitteesta (muuta entityt):
+    # Example second unit:
     # {
     #     "name": "daikin2",
     #     "INDOOR": "sensor.toinen_sisalampo",
@@ -77,11 +70,12 @@ DAIKINS = [
     #     "STORE_ENTITY": "pyscript.daikin2_ml_params",
     #     "LEARNED_SENSOR": "sensor.daikin2_ml_learned_demand",
     #     "LEARNING_ENABLED_HELPER": "input_boolean.daikin2_ml_learning_enabled",
+    #     "QUIET_SWITCH": "switch.toinen_quiet_outdoor",
     # },
 ]
 
 # ============================================================
-# 2) YHTEISET SÄÄTÖVAKIOT
+# 2) TUNING CONSTANTS
 # ============================================================
 HORIZON_H  = 1.0
 FORECAST_H = 6
@@ -91,7 +85,7 @@ MIN_DEM    = 30.0
 MAX_DEM    = 100.0
 KAPPA      = 1.0
 
-GLOBAL_MILD_MAX = 95.0
+GLOBAL_MILD_MAX = 95.0  # normal max without quiet-100 trick
 
 COOLDOWN_MINUTES  = 15
 COOLDOWN_STEP_UP  = 3.0
@@ -110,16 +104,14 @@ AUTO_DB_BASE   = 0.10
 
 
 # ============================================================
-# 3) APURIT
+# 3) HELPERS
 # ============================================================
 def _context_key_for_outdoor(Tout: float) -> str:
     if not isfinite(Tout):
         return "nan"
-    bucket = int(round(Tout))
-    return str(bucket)
+    return str(int(round(Tout)))
 
 def _clip(v, lo, hi):
-    # NaN-safe clip: if v is NaN/inf -> return lo (safe)
     try:
         if not isfinite(float(v)):
             return lo
@@ -170,7 +162,6 @@ def _matscale(A, s):
     return C
 
 def _rls_update(theta, P, x, y, lam=LAMBDA):
-    # Guard: if bad inputs, do nothing
     if (not _all_finite(theta)) or (not _all_finite(x)):
         return theta, P
     try:
@@ -182,13 +173,10 @@ def _rls_update(theta, P, x, y, lam=LAMBDA):
 
     Px = _matvec(P, x)
     denom = lam + _dot(x, Px)
-
-    # Guard denom
     if (not isfinite(denom)) or denom <= 1e-12:
         return theta, P
 
     K = [v / denom for v in Px]
-
     err_est = y_f - _dot(x, theta)
     if not isfinite(err_est):
         return theta, P
@@ -208,8 +196,6 @@ def _rls_update(theta, P, x, y, lam=LAMBDA):
             xTP[i][j] = x[i] * Px[j]
 
     newP = _matscale(_matsub(P, xTP), 1.0 / lam)
-
-    # Guard P too
     for i in range(4):
         for j in range(4):
             if not isfinite(newP[i][j]):
@@ -240,11 +226,10 @@ def _with_pct(select_entity):
 
 def _snap_to_select(select_entity, value, direction):
     nums, has_pct = _select_options_nums(select_entity)
-    picked = None
     if len(nums) == 0:
         picked = round(value)
-        out = str(int(picked)) + ('%' if (has_pct or _with_pct(select_entity)) else '')
-        return out
+        return str(int(picked)) + ('%' if (has_pct or _with_pct(select_entity)) else '')
+
     if direction > 0:
         chosen = None
         for n in nums:
@@ -272,6 +257,7 @@ def _snap_to_select(select_entity, value, direction):
                 bestd = d
                 best = n
         picked = best
+
     if float(picked).is_integer():
         picked = int(picked)
     return str(picked) + ('%' if has_pct else '')
@@ -283,16 +269,17 @@ def _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_curre
         gain = 1.0
     if not isfinite(gain):
         gain = 1.0
-    if gain < 0.1:
-        gain = 0.1
-    if gain > 10.0:
-        gain = 10.0
+    gain = _clip(gain, 0.1, 10.0)
+
     step_raw = AUTO_STEP_BASE / gain
     step_auto = _clip(step_raw, AUTO_STEP_MIN, AUTO_STEP_MAX)
+
     db_raw = AUTO_DB_BASE * (1.0 + 0.2 * gain)
     db_auto = _clip(db_raw, AUTO_DB_MIN, AUTO_DB_MAX)
+
     step_auto_rounded = round(step_auto, 1)
     db_auto_rounded   = round(db_auto, 2)
+
     if (abs(step_auto_rounded - step_limit_current) > 0.1 or
             abs(db_auto_rounded - deadband_current) > 0.01):
         log.info(
@@ -301,6 +288,7 @@ def _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_curre
             step_auto_rounded, step_limit_current,
             db_auto_rounded,   deadband_current,
         )
+
     return step_auto_rounded, db_auto_rounded
 
 def _avg_future_outdoor(weather_entity, outdoor_entity):
@@ -332,7 +320,6 @@ def _avg_future_outdoor(weather_entity, outdoor_entity):
         return 0.0
 
 def _read_bool(entity_id, default=True):
-    """Read HA boolean-ish state robustly."""
     try:
         s = state.get(entity_id)
     except Exception:
@@ -347,11 +334,6 @@ def _read_bool(entity_id, default=True):
     return default
 
 def _learning_enabled_for_unit(unit):
-    """
-    Learning enabled logic:
-    - if per-unit helper exists (state.get != None) -> use it
-    - else use global helper (if exists), default True if not found
-    """
     unit_helper = unit.get("LEARNING_ENABLED_HELPER")
     if unit_helper:
         try:
@@ -360,7 +342,7 @@ def _learning_enabled_for_unit(unit):
                 return _read_bool(unit_helper, default=True)
         except Exception:
             pass
-    # fallback global
+
     try:
         gv = state.get(LEARNING_ENABLED_HELPER_GLOBAL)
         if gv is None:
@@ -369,17 +351,63 @@ def _learning_enabled_for_unit(unit):
     except Exception:
         return True
 
+def _quiet_is_on(quiet_switch):
+    if not quiet_switch:
+        return False
+    try:
+        return str(state.get(quiet_switch)).strip().lower() == "on"
+    except Exception:
+        return False
+
+def _set_quiet(quiet_switch, turn_on, unit_name):
+    if not quiet_switch:
+        return
+    try:
+        cur = _quiet_is_on(quiet_switch)
+        if turn_on and (not cur):
+            switch.turn_on(entity_id=quiet_switch)
+            log.info("Daikin ML (%s): QUIET_SWITCH ON -> %s", unit_name, quiet_switch)
+        elif (not turn_on) and cur:
+            switch.turn_off(entity_id=quiet_switch)
+            log.info("Daikin ML (%s): QUIET_SWITCH OFF -> %s", unit_name, quiet_switch)
+    except Exception as e:
+        log.error("Daikin ML (%s): failed to set QUIET_SWITCH %s: %s", unit_name, quiet_switch, e)
+
+def _apply_demand_with_quiet(unit_name, select_entity, quiet_switch, target_percent, prev_str):
+    """
+    Apply final demand to select + quiet switch:
+      - target <= 95 -> quiet OFF, select snapped
+      - 95 < target < 100 -> quiet ON, select "100%"
+      - target >= 100 -> quiet OFF, select "100%" (real max)
+    """
+    t = float(target_percent)
+
+    if t >= 100.0:
+        _set_quiet(quiet_switch, False, unit_name)
+        option = _snap_to_select(select_entity, 100.0, 0)
+    elif t > GLOBAL_MILD_MAX:
+        # virtual intermediate: "QUIET 100"
+        _set_quiet(quiet_switch, True, unit_name)
+        option = _snap_to_select(select_entity, 100.0, 0)
+    else:
+        _set_quiet(quiet_switch, False, unit_name)
+        option = _snap_to_select(select_entity, t, 0)
+
+    if option and option != prev_str:
+        select.select_option(entity_id=select_entity, option=option)
+
+    return option
+
 
 # ============================================================
-# 4) PER-LAITE TILA (THETA/P + DEFROST-COOLDOWN)
+# 4) STATE (per unit)
 # ============================================================
-_theta_by_unit_ctx = {}   # unit -> ctx -> theta[4]
-_P_by_unit_ctx     = {}   # unit -> ctx -> P[4x4]
-_params_loaded     = {}   # unit -> bool
+_theta_by_unit_ctx = {}
+_P_by_unit_ctx     = {}
+_params_loaded     = {}
 
-_last_defrosting   = {}   # unit -> bool/None
-_cooldown_until    = {}   # unit -> epoch float
-
+_last_defrosting   = {}
+_cooldown_until    = {}
 
 def _persist_all_stores():
     for u in DAIKINS:
@@ -437,11 +465,7 @@ def _save_params_to_store(unit):
             round(float(th[3]), 4),
         ]
     try:
-        state.set(
-            store,
-            value=time.time(),
-            theta_by_ctx=clean,
-        )
+        state.set(store, value=time.time(), theta_by_ctx=clean)
     except Exception as e:
         log.error("Daikin ML (%s): error saving thetas to %s: %s", unit_name, store, e)
 
@@ -456,7 +480,6 @@ def _init_context_params_if_needed(unit):
 
     _load_params_from_store(unit)
 
-    # P-matriisit muistiin vain runtimeen (ei tallenneta storeen)
     for key in (_theta_by_unit_ctx.get(unit_name) or {}).keys():
         _P_by_unit_ctx[unit_name][str(key)] = [[P0, 0, 0, 0],
                                                [0, P0, 0, 0],
@@ -466,7 +489,7 @@ def _init_context_params_if_needed(unit):
 
 
 # ============================================================
-# 5) STARTUP + TRIGGERIT
+# 5) STARTUP + TRIGGERS
 # ============================================================
 _persist_all_stores()
 
@@ -505,7 +528,7 @@ def daikin_ml_controller(**kwargs):
 
 
 # ============================================================
-# 6) VARSINAINEN LOGIIKKA PER LAITE
+# 6) CONTROL LOGIC (per unit)
 # ============================================================
 def _run_one_unit(u):
     unit_name = u["name"]
@@ -517,6 +540,7 @@ def _run_one_unit(u):
     WEATHER = u["WEATHER"]
     SELECT = u["SELECT"]
     LIQUID = u["LIQUID"]
+    QUIET_SWITCH = u.get("QUIET_SWITCH")
 
     SP_HELPER = u["SP_HELPER"]
     STEP_LIMIT_HELPER = u["STEP_LIMIT_HELPER"]
@@ -524,7 +548,6 @@ def _run_one_unit(u):
     ICING_CAP_HELPER = u["ICING_CAP_HELPER"]
     LEARNED_SENSOR = u["LEARNED_SENSOR"]
 
-    # Learning helper state
     learning_enabled = _learning_enabled_for_unit(u)
 
     try:
@@ -536,7 +559,6 @@ def _run_one_unit(u):
     except Exception:
         Tout_raw = float("nan")
 
-    # RATE FIX: float("nan") does not raise -> must isfinite-check
     try:
         rate = float(state.get(INDOOR_RATE) or 0.0)
     except Exception:
@@ -552,7 +574,6 @@ def _run_one_unit(u):
         rate_bad = False
 
     sp = float(state.get(SP_HELPER) or 22.5)
-
     step_limit_current = float(state.get(STEP_LIMIT_HELPER) or 10.0)
     deadband_current   = float(state.get(DEADBAND_HELPER) or 0.1)
 
@@ -562,13 +583,15 @@ def _run_one_unit(u):
     except Exception:
         prev = 60.0
 
+    # NOTE: "prev_eff" will still be based on numeric select value, not quiet state
+    quiet_prev = _quiet_is_on(QUIET_SWITCH)
+
     try:
         liquid = float(state.get(LIQUID) or 100.0)
     except Exception:
         liquid = 100.0
     if not isfinite(liquid):
         liquid = 100.0
-
     defrosting = (liquid < 20.0)
 
     now = time.time()
@@ -598,7 +621,6 @@ def _run_one_unit(u):
     theta = _theta_by_unit_ctx[unit_name][ctx]
     P     = _P_by_unit_ctx[unit_name][ctx]
 
-    # theta guard: if somehow corrupted, reset to defaults (per ctx)
     if not _all_finite(theta):
         log.error("Daikin ML (%s): theta not finite for ctx=%s -> resetting theta/P", unit_name, ctx)
         theta = [0.0, 0.0, 5.0, 0.0]
@@ -612,13 +634,13 @@ def _run_one_unit(u):
 
     step_limit, deadband = _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_current)
 
-    # Globaali max bucketin perusteella
+    # Global upper (your old rule)
     if Tout_bucket <= -5:
         global_upper = MAX_DEM
     else:
         global_upper = GLOBAL_MILD_MAX
 
-    # Icing band
+    # Icing cap
     try:
         icing_cap = float(state.get(ICING_CAP_HELPER) or ICING_BAND_CAP_DEFAULT)
     except Exception:
@@ -630,8 +652,10 @@ def _run_one_unit(u):
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
     band_upper = min(global_upper, icing_cap) if in_icing_band else global_upper
 
-    # jos edellinen yli band_upper, tiputetaan heti
+    # CAP ENFORCEMENT:
+    # If previous is > band_upper, clamp down and ensure quiet is OFF (we're capping)
     if prev > band_upper:
+        _set_quiet(QUIET_SWITCH, False, unit_name)
         option_cap = _snap_to_select(SELECT, band_upper, -1)
         if option_cap and option_cap != prev_str:
             select.select_option(entity_id=SELECT, option=option_cap)
@@ -648,7 +672,6 @@ def _run_one_unit(u):
     x = [1.0, err, demand_norm, (Tout_raw - Tin)]
     y = rate
 
-    # LEARNING ENABLE LOGIC INCLUDED HERE
     allow_learning = (
         learning_enabled
         and (not defrosting)
@@ -659,9 +682,7 @@ def _run_one_unit(u):
     if allow_learning:
         theta_prev = theta[:]
         P_prev = [row[:] for row in P]
-
         theta_new, P_new = _rls_update(theta, P, x, y)
-
         if _all_finite(theta_new):
             theta = theta_new
             P = P_new
@@ -698,45 +719,42 @@ def _run_one_unit(u):
         denom_mag = 0.5
 
     dem_opt = _clip((num / (denom_mag * denom_sign)) * 100.0, 0.0, 100.0)
-
     if not isfinite(dem_opt):
-        log.error(
-            "Daikin ML (%s): dem_opt became non-finite (ctx=%s). Falling back to prev_eff=%.1f",
-            unit_name, ctx, prev_eff
-        )
+        log.error("Daikin ML (%s): dem_opt non-finite (ctx=%s) -> fallback prev_eff=%.1f", unit_name, ctx, prev_eff)
         dem_opt = prev_eff
 
-    # Learned demand -sensori (raaka ML-optimi)
-    try:
-        state.set(
-            LEARNED_SENSOR,
-            value=round(float(dem_opt), 1),
-            unit=unit_name,
-            ctx=ctx,
-            outdoor_bucket=Tout_bucket,
-            outdoor=round(Tout_raw, 1),
-            setpoint=round(sp, 2),
-            indoor=round(Tin, 2),
-            defrosting=defrosting,
-            cooldown=in_cooldown,
-            rate=round(rate, 4),
-            learning_enabled=bool(learning_enabled),
-            learning_allowed=bool(allow_learning),
-        )
-    except Exception as e:
-        log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
+    # OPTION A: update learned-demand sensor only if learning is enabled
+    if learning_enabled:
+        try:
+            state.set(
+                LEARNED_SENSOR,
+                value=round(float(dem_opt), 1),
+                unit=unit_name,
+                ctx=ctx,
+                outdoor_bucket=Tout_bucket,
+                outdoor=round(Tout_raw, 1),
+                setpoint=round(sp, 2),
+                indoor=round(Tin, 2),
+                defrosting=defrosting,
+                cooldown=in_cooldown,
+                rate=round(rate, 4),
+                learning_enabled=True,
+                learning_allowed=bool(allow_learning),
+            )
+        except Exception as e:
+            log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
 
-    # Deadband: pidä ennallaan
+    # deadband
     if abs(err) <= deadband:
         dem_target = prev_eff
     else:
         dem_target = dem_opt
 
-    # Monotoninen ehto: jos ollaan kylmällä puolella, demand ei saa laskea
+    # monotonic: if cold side, don't decrease
     if err > deadband and dem_target < prev_eff:
         dem_target = prev_eff
 
-    # delta ja step/cooldown -rajat
+    # step limits
     delta = dem_target - prev_eff
     if delta > 0:
         up_limit = COOLDOWN_STEP_UP if in_cooldown else step_limit
@@ -747,51 +765,43 @@ def _run_one_unit(u):
         if -delta > down_limit:
             dem_target = prev_eff - down_limit
 
-    dem_clip = _clip(dem_target, MIN_DEM, band_upper)
-    option = _snap_to_select(SELECT, dem_clip, 0)
+    # final cap:
+    # IMPORTANT: We allow dem_clip to go up to 100 always; mapping to "quiet 100" will happen in apply.
+    # band_upper is still the logical cap. If band_upper == 95, you cannot go above 95 (so no quiet-100).
+    dem_clip = _clip(dem_target, MIN_DEM, min(band_upper, 100.0))
 
-    try:
-        opt_num = float(str(option).replace('%', ''))
-    except Exception:
-        opt_num = 999.0
-    if opt_num > band_upper:
-        option = _snap_to_select(SELECT, band_upper, -1)
-        log.info(
-            "Daikin ML (%s): post-cap clamp -> %s (upper=%.0f%%, ctx=%s, Tout_bucket=%d)",
-            unit_name, option, band_upper, ctx, Tout_bucket,
-        )
-
-    if option and option != prev_str:
-        select.select_option(entity_id=SELECT, option=option)
+    # Apply demand with quiet-intermediate logic
+    option = _apply_demand_with_quiet(unit_name, SELECT, QUIET_SWITCH, dem_clip, prev_str)
 
     theta_str = "[" + ", ".join([str(round(float(v), 4)) for v in theta]) + "]"
     cool_str  = "ACTIVE" if in_cooldown else "off"
     icing_str = "ON" if in_icing_band else "off"
+
     log.info(
         "Daikin ML (%s): ctx=%s | Tin=%.2f°C, Tout=%.2f°C (bucket=%d, →%.1f°C), "
         "DEFROST=%s, cooldown=%s, learning_enabled=%s, learning_allowed=%s, rate_bad=%s, "
         "icing_band=%s, band_upper=%.0f%%, theta=%s | "
         "SP=%.2f, step_limit=%.1f, deadband=%.2f | "
-        "prev=%s → opt≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s",
+        "prev=%s (quiet=%s) → opt≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s (quiet_now=%s)",
         unit_name, ctx, Tin, Tout_raw, Tout_bucket, Tout_future,
         str(defrosting), cool_str, str(learning_enabled), str(allow_learning), str(rate_bad),
         icing_str, band_upper, theta_str,
         sp, step_limit, deadband,
-        prev_str, dem_opt, dem_target, dem_clip, option,
+        prev_str, str(quiet_prev), dem_opt, dem_target, dem_clip, option, str(_quiet_is_on(QUIET_SWITCH)),
     )
 
 
 # ============================================================
-# 7) PALVELUT
+# 7) SERVICES
 # ============================================================
 @service
 def daikin_ml_step():
-    """Aja ohjain kerran (kaikille laitteille)."""
+    """Run controller once (all units)."""
     daikin_ml_controller()
 
 @service
 def daikin_ml_reset():
-    """Nollaa kaikkien laitteiden ML-opit ja aloita alusta."""
+    """Reset learning for all units."""
     global _theta_by_unit_ctx, _P_by_unit_ctx, _params_loaded, _last_defrosting, _cooldown_until
 
     for u in DAIKINS:
@@ -806,11 +816,7 @@ def daikin_ml_reset():
         _cooldown_until[unit_name] = 0.0
 
         try:
-            state.set(
-                u["STORE_ENTITY"],
-                value=time.time(),
-                theta_by_ctx={},
-            )
+            state.set(u["STORE_ENTITY"], value=time.time(), theta_by_ctx={})
             log.warning(
                 "Daikin ML RESET (%s): cleared %d learned contexts, theta_by_ctx now empty in %s",
                 unit_name, old_cnt, u["STORE_ENTITY"],
@@ -820,12 +826,12 @@ def daikin_ml_reset():
 
 @service
 def daikin_ml_persist():
-    """Persistoi store-entiteetit (varmistus)."""
+    """Persist store entities (safety)."""
     _persist_all_stores()
 
 @service
 def daikin_ml_learning_enable():
-    """Enable learning globally (input_boolean.daikin_ml_learning_enabled)."""
+    """Enable learning globally."""
     try:
         input_boolean.turn_on(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
         log.info("Daikin ML: learning enabled (global) -> %s", LEARNING_ENABLED_HELPER_GLOBAL)
@@ -834,7 +840,7 @@ def daikin_ml_learning_enable():
 
 @service
 def daikin_ml_learning_disable():
-    """Disable learning globally (input_boolean.daikin_ml_learning_enabled)."""
+    """Disable learning globally."""
     try:
         input_boolean.turn_off(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
         log.info("Daikin ML: learning disabled (global) -> %s", LEARNING_ENABLED_HELPER_GLOBAL)
@@ -843,7 +849,7 @@ def daikin_ml_learning_disable():
 
 @service
 def daikin_ml_learning_toggle():
-    """Toggle learning globally (input_boolean.daikin_ml_learning_enabled)."""
+    """Toggle learning globally."""
     try:
         cur = state.get(LEARNING_ENABLED_HELPER_GLOBAL)
         cur_on = (str(cur).strip().lower() == "on")
@@ -858,6 +864,6 @@ def daikin_ml_learning_toggle():
 
 
 # ============================================================
-# 8) STORE PERSIST (optional helper)
+# 8) PERSIST STORES AT LOAD
 # ============================================================
 _persist_all_stores()
