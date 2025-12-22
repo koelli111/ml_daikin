@@ -1,21 +1,26 @@
 # pyscript/daikin_ml_multi.py
 # Online-RLS (oppiva) ohjain Daikin demand-selectille, MULTI-DAIKIN -tuella.
 #
-# NEW: "QUIET 100" intermediate level above 95% but below real 100%
-# - If demand target is > GLOBAL_MILD_MAX (95) but < 100:
-#     -> select 100% AND turn ON QUIET_SWITCH (e.g. switch.faikin_quiet_outdoor)
-# - If demand target is >= 100:
-#     -> select 100% AND turn OFF QUIET_SWITCH (real max)
-# - If demand target <= 95:
-#     -> QUIET_SWITCH OFF (normal behavior)
+# FEATURES INCLUDED:
+# - Multi-daikin support (DAIKINS list)
+# - NaN/inf guards (rate/x/y/theta/dem_opt, store load/save ignores non-finite)
+# - Learning enable switch (global + per-unit override)
+# - OPTION A:
+#     * When learning is enabled -> learned-demand sensor value follows dem_opt
+#     * When learning is disabled -> learned-demand sensor value is FROZEN,
+#       but attributes are still updated every tick (so debug attrs don't disappear)
+# - "QUIET 100" intermediate level:
+#     * demand <= 95  -> quiet OFF, select snapped
+#     * 95 < demand < 100 -> select 100 + quiet ON  (virtual level)
+#     * demand >= 100 -> select 100 + quiet OFF     (real max)
+# - Nord Pool 15-min price bias integration (per-unit input_number bias points):
+#     * Reads u["PRICE_BIAS_HELPER"] (e.g. input_number.daikin1_price_bias_points)
+#     * Adds bias (demand points) to dem_target AFTER monotonic constraint,
+#       BEFORE step limiting + final clip/snap.
 #
-# OPTION A:
-# - Learned-demand sensor updated ONLY when learning_enabled == True
-#
-# FIXES:
-# - NaN/inf guards for rate / x / y / theta / dem_opt
-# - _clip NaN-safe, _rls_update guarded
-# - store load/save ignores non-finite thetas
+# NOTE:
+# - Controller clips to band_upper (e.g. 95 in mild weather), so price bias cannot push above the cap
+#   unless your existing caps allow it. Quiet-100 only activates when dem_clip > 95 and < 100.
 
 import time
 from math import isfinite
@@ -50,8 +55,11 @@ DAIKINS = [
 
         "LEARNING_ENABLED_HELPER": "input_boolean.daikin1_ml_learning_enabled",
 
-        # NEW: quiet outdoor switch used to create intermediate "QUIET 100" level
+        # Quiet switch for "QUIET 100" virtual level
         "QUIET_SWITCH": "switch.faikin_quiet_outdoor",
+
+        # Nordpool price bias helper (demand points), set by nordpool_15m_bias.py
+        "PRICE_BIAS_HELPER": "input_number.daikin1_price_bias_points",
     },
 
     # Example second unit:
@@ -71,6 +79,7 @@ DAIKINS = [
     #     "LEARNED_SENSOR": "sensor.daikin2_ml_learned_demand",
     #     "LEARNING_ENABLED_HELPER": "input_boolean.daikin2_ml_learning_enabled",
     #     "QUIET_SWITCH": "switch.toinen_quiet_outdoor",
+    #     "PRICE_BIAS_HELPER": "input_number.daikin2_price_bias_points",
     # },
 ]
 
@@ -85,7 +94,7 @@ MIN_DEM    = 30.0
 MAX_DEM    = 100.0
 KAPPA      = 1.0
 
-GLOBAL_MILD_MAX = 95.0  # normal max without quiet-100 trick
+GLOBAL_MILD_MAX = 95.0  # normal max without "quiet 100" trick
 
 COOLDOWN_MINUTES  = 15
 COOLDOWN_STEP_UP  = 3.0
@@ -386,7 +395,6 @@ def _apply_demand_with_quiet(unit_name, select_entity, quiet_switch, target_perc
         _set_quiet(quiet_switch, False, unit_name)
         option = _snap_to_select(select_entity, 100.0, 0)
     elif t > GLOBAL_MILD_MAX:
-        # virtual intermediate: "QUIET 100"
         _set_quiet(quiet_switch, True, unit_name)
         option = _snap_to_select(select_entity, 100.0, 0)
     else:
@@ -397,6 +405,19 @@ def _apply_demand_with_quiet(unit_name, select_entity, quiet_switch, target_perc
         select.select_option(entity_id=select_entity, option=option)
 
     return option
+
+def _read_price_bias_points(unit):
+    """Read per-unit price bias (demand points). Missing/invalid -> 0.0"""
+    ent = unit.get("PRICE_BIAS_HELPER")
+    if not ent:
+        return 0.0
+    try:
+        v = float(state.get(ent) or 0.0)
+        if not isfinite(v):
+            return 0.0
+        return v
+    except Exception:
+        return 0.0
 
 
 # ============================================================
@@ -504,13 +525,14 @@ for u in DAIKINS:
 def _ml_startup_ok():
     for u in DAIKINS:
         _init_context_params_if_needed(u)
+        # Initialize sensor once (we will keep it updated every tick later anyway)
         try:
             state.set(
                 u["LEARNED_SENSOR"],
                 value=0.0,
                 unit=u["name"],
                 ctx="init",
-                note="raw ML demand (dem_opt) before caps/step/cooldown"
+                note="init"
             )
         except Exception as e:
             log.error("Daikin ML (%s): failed to init learned demand sensor: %s", u["name"], e)
@@ -541,6 +563,7 @@ def _run_one_unit(u):
     SELECT = u["SELECT"]
     LIQUID = u["LIQUID"]
     QUIET_SWITCH = u.get("QUIET_SWITCH")
+    PRICE_BIAS_HELPER = u.get("PRICE_BIAS_HELPER")
 
     SP_HELPER = u["SP_HELPER"]
     STEP_LIMIT_HELPER = u["STEP_LIMIT_HELPER"]
@@ -583,7 +606,6 @@ def _run_one_unit(u):
     except Exception:
         prev = 60.0
 
-    # NOTE: "prev_eff" will still be based on numeric select value, not quiet state
     quiet_prev = _quiet_is_on(QUIET_SWITCH)
 
     try:
@@ -634,7 +656,7 @@ def _run_one_unit(u):
 
     step_limit, deadband = _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_current)
 
-    # Global upper (your old rule)
+    # Global upper rule
     if Tout_bucket <= -5:
         global_upper = MAX_DEM
     else:
@@ -652,8 +674,7 @@ def _run_one_unit(u):
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
     band_upper = min(global_upper, icing_cap) if in_icing_band else global_upper
 
-    # CAP ENFORCEMENT:
-    # If previous is > band_upper, clamp down and ensure quiet is OFF (we're capping)
+    # If previous is > cap, clamp and quiet OFF
     if prev > band_upper:
         _set_quiet(QUIET_SWITCH, False, unit_name)
         option_cap = _snap_to_select(SELECT, band_upper, -1)
@@ -723,26 +744,47 @@ def _run_one_unit(u):
         log.error("Daikin ML (%s): dem_opt non-finite (ctx=%s) -> fallback prev_eff=%.1f", unit_name, ctx, prev_eff)
         dem_opt = prev_eff
 
-    # OPTION A: update learned-demand sensor only if learning is enabled
-    if learning_enabled:
-        try:
-            state.set(
-                LEARNED_SENSOR,
-                value=round(float(dem_opt), 1),
-                unit=unit_name,
-                ctx=ctx,
-                outdoor_bucket=Tout_bucket,
-                outdoor=round(Tout_raw, 1),
-                setpoint=round(sp, 2),
-                indoor=round(Tin, 2),
-                defrosting=defrosting,
-                cooldown=in_cooldown,
-                rate=round(rate, 4),
-                learning_enabled=True,
-                learning_allowed=bool(allow_learning),
-            )
-        except Exception as e:
-            log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
+    # Read Nordpool bias early so it's available for sensor attrs and control
+    price_bias = _read_price_bias_points(u)
+
+    # OPTION A (improved):
+    # - learning enabled: sensor value follows dem_opt
+    # - learning disabled: sensor value frozen, BUT attributes updated every tick
+    try:
+        if learning_enabled:
+            learned_value = round(float(dem_opt), 1)
+            note = "learning enabled: value follows dem_opt"
+        else:
+            prev_val = state.get(LEARNED_SENSOR)
+            try:
+                learned_value = float(prev_val)
+                if not isfinite(learned_value):
+                    learned_value = 0.0
+            except Exception:
+                learned_value = 0.0
+            learned_value = round(float(learned_value), 1)
+            note = "learning disabled: value frozen, attributes updated"
+
+        state.set(
+            LEARNED_SENSOR,
+            value=learned_value,
+            unit=unit_name,
+            ctx=ctx,
+            outdoor_bucket=Tout_bucket,
+            outdoor=round(Tout_raw, 1),
+            setpoint=round(sp, 2),
+            indoor=round(Tin, 2),
+            defrosting=defrosting,
+            cooldown=in_cooldown,
+            rate=round(rate, 4),
+            learning_enabled=bool(learning_enabled),
+            learning_allowed=bool(allow_learning),
+            price_bias_points=round(float(price_bias), 2),
+            price_bias_helper=str(PRICE_BIAS_HELPER),
+            note=note,
+        )
+    except Exception as e:
+        log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
 
     # deadband
     if abs(err) <= deadband:
@@ -754,7 +796,11 @@ def _run_one_unit(u):
     if err > deadband and dem_target < prev_eff:
         dem_target = prev_eff
 
-    # step limits
+    # apply Nordpool price bias (demand points) AFTER monotonic constraint
+    if abs(price_bias) > 0.0001:
+        dem_target = dem_target + price_bias
+
+    # step limits (price bias is included in delta here)
     delta = dem_target - prev_eff
     if delta > 0:
         up_limit = COOLDOWN_STEP_UP if in_cooldown else step_limit
@@ -765,9 +811,7 @@ def _run_one_unit(u):
         if -delta > down_limit:
             dem_target = prev_eff - down_limit
 
-    # final cap:
-    # IMPORTANT: We allow dem_clip to go up to 100 always; mapping to "quiet 100" will happen in apply.
-    # band_upper is still the logical cap. If band_upper == 95, you cannot go above 95 (so no quiet-100).
+    # final cap: keep logical cap at band_upper (so no >95 unless allowed by band_upper)
     dem_clip = _clip(dem_target, MIN_DEM, min(band_upper, 100.0))
 
     # Apply demand with quiet-intermediate logic
@@ -782,11 +826,13 @@ def _run_one_unit(u):
         "DEFROST=%s, cooldown=%s, learning_enabled=%s, learning_allowed=%s, rate_bad=%s, "
         "icing_band=%s, band_upper=%.0f%%, theta=%s | "
         "SP=%.2f, step_limit=%.1f, deadband=%.2f | "
+        "price_bias=%.2f pts (%s) | "
         "prev=%s (quiet=%s) → opt≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s (quiet_now=%s)",
         unit_name, ctx, Tin, Tout_raw, Tout_bucket, Tout_future,
         str(defrosting), cool_str, str(learning_enabled), str(allow_learning), str(rate_bad),
         icing_str, band_upper, theta_str,
         sp, step_limit, deadband,
+        float(price_bias), str(PRICE_BIAS_HELPER),
         prev_str, str(quiet_prev), dem_opt, dem_target, dem_clip, option, str(_quiet_is_on(QUIET_SWITCH)),
     )
 
