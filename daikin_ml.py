@@ -1,5 +1,14 @@
 # pyscript/daikin_ml_multi.py
 # Online-RLS (oppiva) ohjain Daikin demand-selectille, MULTI-DAIKIN -tuella.
+#
+# ADDITIONS:
+# - Helper to switch learning on/off:
+#     * input_boolean.daikin_ml_learning_enabled (global)
+#     * optional per-unit override: input_boolean.daikin1_ml_learning_enabled, input_boolean.daikin2_ml_learning_enabled, ...
+#   Logic:
+#     - If per-unit helper exists, it takes precedence for that unit.
+#     - Otherwise global helper is used.
+#
 # FIXES:
 # - NaN/inf-suojaukset: rate / x / y / theta / dem_opt ei voi enää korruptoitua tai mennä NaN:ksi
 # - _clip on NaN-safe
@@ -13,7 +22,17 @@ import time
 from math import isfinite
 
 # ============================================================
-# 1) LAITEKONFIGURAATIOT (LISÄÄ TÄHÄN UUSIA DAIKINEITA)
+# 0) LEARNING ENABLE HELPERS
+# ============================================================
+# Create these in Home Assistant:
+# - input_boolean.daikin_ml_learning_enabled   (global master switch)
+# Optionally per unit (takes precedence if exists):
+# - input_boolean.daikin1_ml_learning_enabled
+# - input_boolean.daikin2_ml_learning_enabled
+LEARNING_ENABLED_HELPER_GLOBAL = "input_boolean.daikin_ml_learning_enabled"
+
+# ============================================================
+# 1) LAITEKONFIGURAATIOT (LISÄÄ TÄHÄN UUSIA DAIKINEita)
 # ============================================================
 DAIKINS = [
     {
@@ -37,6 +56,9 @@ DAIKINS = [
 
         # Learned-demand sensori per laite
         "LEARNED_SENSOR": "sensor.daikin1_ml_learned_demand",
+
+        # Optional per-unit learning switch (if you create it)
+        "LEARNING_ENABLED_HELPER": "input_boolean.daikin1_ml_learning_enabled",
     },
 
     # Esimerkki toisesta laitteesta (muuta entityt):
@@ -54,11 +76,12 @@ DAIKINS = [
     #     "ICING_CAP_HELPER": "input_number.daikin2_icing_cap",
     #     "STORE_ENTITY": "pyscript.daikin2_ml_params",
     #     "LEARNED_SENSOR": "sensor.daikin2_ml_learned_demand",
+    #     "LEARNING_ENABLED_HELPER": "input_boolean.daikin2_ml_learning_enabled",
     # },
 ]
 
 # ============================================================
-# 2) YHTEISET SÄÄTÖVAKIOT (KUTEN ENNEN)
+# 2) YHTEISET SÄÄTÖVAKIOT
 # ============================================================
 HORIZON_H  = 1.0
 FORECAST_H = 6
@@ -308,6 +331,44 @@ def _avg_future_outdoor(weather_entity, outdoor_entity):
     except Exception:
         return 0.0
 
+def _read_bool(entity_id, default=True):
+    """Read HA boolean-ish state robustly."""
+    try:
+        s = state.get(entity_id)
+    except Exception:
+        return default
+    if s is None:
+        return default
+    ss = str(s).strip().lower()
+    if ss in ("on", "true", "1", "yes", "enabled"):
+        return True
+    if ss in ("off", "false", "0", "no", "disabled"):
+        return False
+    return default
+
+def _learning_enabled_for_unit(unit):
+    """
+    Learning enabled logic:
+    - if per-unit helper exists (state.get != None) -> use it
+    - else use global helper (if exists), default True if not found
+    """
+    unit_helper = unit.get("LEARNING_ENABLED_HELPER")
+    if unit_helper:
+        try:
+            v = state.get(unit_helper)
+            if v is not None:
+                return _read_bool(unit_helper, default=True)
+        except Exception:
+            pass
+    # fallback global
+    try:
+        gv = state.get(LEARNING_ENABLED_HELPER_GLOBAL)
+        if gv is None:
+            return True
+        return _read_bool(LEARNING_ENABLED_HELPER_GLOBAL, default=True)
+    except Exception:
+        return True
+
 
 # ============================================================
 # 4) PER-LAITE TILA (THETA/P + DEFROST-COOLDOWN)
@@ -463,6 +524,9 @@ def _run_one_unit(u):
     ICING_CAP_HELPER = u["ICING_CAP_HELPER"]
     LEARNED_SENSOR = u["LEARNED_SENSOR"]
 
+    # Learning helper state
+    learning_enabled = _learning_enabled_for_unit(u)
+
     try:
         Tin = float(state.get(INDOOR))
     except Exception:
@@ -584,16 +648,20 @@ def _run_one_unit(u):
     x = [1.0, err, demand_norm, (Tout_raw - Tin)]
     y = rate
 
-    allow_learning = (not defrosting) and (not in_cooldown) and (not rate_bad)
+    # LEARNING ENABLE LOGIC INCLUDED HERE
+    allow_learning = (
+        learning_enabled
+        and (not defrosting)
+        and (not in_cooldown)
+        and (not rate_bad)
+    )
 
     if allow_learning:
-        # backup in case of corruption
         theta_prev = theta[:]
         P_prev = [row[:] for row in P]
 
         theta_new, P_new = _rls_update(theta, P, x, y)
 
-        # ensure finite
         if _all_finite(theta_new):
             theta = theta_new
             P = P_new
@@ -610,8 +678,8 @@ def _run_one_unit(u):
         _theta_by_unit_ctx[unit_name][ctx] = theta
         _P_by_unit_ctx[unit_name][ctx] = P
         log.debug(
-            "Daikin ML (%s): learning paused (defrost=%s, cooldown=%s, rate_bad=%s, ctx=%s)",
-            unit_name, defrosting, in_cooldown, rate_bad, ctx,
+            "Daikin ML (%s): learning paused (learning_enabled=%s, defrost=%s, cooldown=%s, rate_bad=%s, ctx=%s)",
+            unit_name, str(learning_enabled), defrosting, in_cooldown, rate_bad, ctx,
         )
 
     Tout_future = _avg_future_outdoor(WEATHER, OUTDOOR)
@@ -621,7 +689,6 @@ def _run_one_unit(u):
     num = dTin_target - (theta[0] + theta[1] * err + theta[3] * (Tout_eff - Tin))
 
     denom_raw = theta[2]
-    # denom guard
     if (not isfinite(denom_raw)) or abs(denom_raw) < 1e-6:
         denom_raw = 5.0
 
@@ -632,7 +699,6 @@ def _run_one_unit(u):
 
     dem_opt = _clip((num / (denom_mag * denom_sign)) * 100.0, 0.0, 100.0)
 
-    # dem_opt guard (belt-and-suspenders): never allow NaN into sensor/logics
     if not isfinite(dem_opt):
         log.error(
             "Daikin ML (%s): dem_opt became non-finite (ctx=%s). Falling back to prev_eff=%.1f",
@@ -654,6 +720,8 @@ def _run_one_unit(u):
             defrosting=defrosting,
             cooldown=in_cooldown,
             rate=round(rate, 4),
+            learning_enabled=bool(learning_enabled),
+            learning_allowed=bool(allow_learning),
         )
     except Exception as e:
         log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
@@ -701,12 +769,12 @@ def _run_one_unit(u):
     icing_str = "ON" if in_icing_band else "off"
     log.info(
         "Daikin ML (%s): ctx=%s | Tin=%.2f°C, Tout=%.2f°C (bucket=%d, →%.1f°C), "
-        "DEFROST=%s, cooldown=%s, rate_bad=%s, "
+        "DEFROST=%s, cooldown=%s, learning_enabled=%s, learning_allowed=%s, rate_bad=%s, "
         "icing_band=%s, band_upper=%.0f%%, theta=%s | "
         "SP=%.2f, step_limit=%.1f, deadband=%.2f | "
         "prev=%s → opt≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s",
         unit_name, ctx, Tin, Tout_raw, Tout_bucket, Tout_future,
-        str(defrosting), cool_str, str(rate_bad),
+        str(defrosting), cool_str, str(learning_enabled), str(allow_learning), str(rate_bad),
         icing_str, band_upper, theta_str,
         sp, step_limit, deadband,
         prev_str, dem_opt, dem_target, dem_clip, option,
@@ -750,11 +818,46 @@ def daikin_ml_reset():
         except Exception as e:
             log.error("Daikin ML RESET (%s): error resetting params in %s: %s", unit_name, u["STORE_ENTITY"], e)
 
-
-# ============================================================
-# 8) STORE PERSIST (optional helper)
-# ============================================================
 @service
 def daikin_ml_persist():
     """Persistoi store-entiteetit (varmistus)."""
     _persist_all_stores()
+
+@service
+def daikin_ml_learning_enable():
+    """Enable learning globally (input_boolean.daikin_ml_learning_enabled)."""
+    try:
+        input_boolean.turn_on(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
+        log.info("Daikin ML: learning enabled (global) -> %s", LEARNING_ENABLED_HELPER_GLOBAL)
+    except Exception as e:
+        log.error("Daikin ML: failed to enable learning global: %s", e)
+
+@service
+def daikin_ml_learning_disable():
+    """Disable learning globally (input_boolean.daikin_ml_learning_enabled)."""
+    try:
+        input_boolean.turn_off(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
+        log.info("Daikin ML: learning disabled (global) -> %s", LEARNING_ENABLED_HELPER_GLOBAL)
+    except Exception as e:
+        log.error("Daikin ML: failed to disable learning global: %s", e)
+
+@service
+def daikin_ml_learning_toggle():
+    """Toggle learning globally (input_boolean.daikin_ml_learning_enabled)."""
+    try:
+        cur = state.get(LEARNING_ENABLED_HELPER_GLOBAL)
+        cur_on = (str(cur).strip().lower() == "on")
+        if cur_on:
+            input_boolean.turn_off(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
+            log.info("Daikin ML: learning toggled OFF (global)")
+        else:
+            input_boolean.turn_on(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
+            log.info("Daikin ML: learning toggled ON (global)")
+    except Exception as e:
+        log.error("Daikin ML: failed to toggle learning global: %s", e)
+
+
+# ============================================================
+# 8) STORE PERSIST (optional helper)
+# ============================================================
+_persist_all_stores()
