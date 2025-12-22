@@ -68,6 +68,35 @@ input_number:
     max: 0.5
     step: 0.05
 
+  daikin1_price_bias_points:
+    name: "Daikin1 price bias (points)"
+    icon: mdi:flash
+    min: -30
+    max: 30
+    step: 0.1
+    mode: box
+    unit_of_measurement: "pts"
+
+  # Average window for Nordpool bias average calculation (hours)
+  nordpool_avg_window_hours:
+    name: "Nordpool avg window (hours)"
+    icon: mdi:clock-outline
+    min: 0.25
+    max: 48
+    step: 0.25
+    mode: box
+    unit_of_measurement: "h"
+
+  # Optional: if you have daikin2, uncomment
+  # daikin2_price_bias_points:
+  #   name: "Daikin2 price bias (points)"
+  #   icon: mdi:flash
+  #   min: -30
+  #   max: 30
+  #   step: 0.1
+  #   mode: box
+  #   unit_of_measurement: "pts"
+
 template:
 
   - sensor:
