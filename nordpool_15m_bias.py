@@ -4,14 +4,14 @@
 #
 # Supports multiple sensor attribute structures:
 #
-# A) Your original:
+# A) Original
 #   state = current price
 #   attributes.records:
 #     - Time: '2025-12-22T00:00:00'
 #       End:  '2025-12-22T00:15:00'
 #       Price: 5.45
 #
-# B) New structure (your request):
+# B) New structure
 #   attributes.raw_today:
 #     - start: '2025-12-23T00:00:00+02:00'
 #       end:   '2025-12-23T00:15:00+02:00'
