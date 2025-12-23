@@ -1,29 +1,21 @@
 # pyscript/daikin_ml_multi.py
-# Online-RLS (oppiva) ohjain Daikin demand-selectille, MULTI-DAIKIN -tuella.
+# Online-RLS Daikin demand controller with MULTI-DAIKIN support.
 #
-# FEATURES INCLUDED:
+# Included:
 # - Multi-daikin support (DAIKINS list)
-# - NaN/inf guards (rate/x/y/theta/dem_opt, store load/save ignores non-finite)
+# - NaN/inf guards
 # - Learning enable switch (global + per-unit override)
-# - OPTION A (improved):
-#     * learning enabled  -> learned-demand sensor value follows dem_opt
-#     * learning disabled -> learned-demand sensor value frozen, attributes updated every tick
+# - OPTION A (improved learned sensor): value frozen when learning disabled, attrs always updated
 # - Nord Pool 15-min price bias integration (per-unit input_number bias points)
+# - Quiet Outdoor support IF available; if QUIET_SWITCH missing/not existing -> skip quiet logic and use normal 95->100
+# - REAL 100% "last resort" gating ONLY when quiet is available (because QUIET 100 intermediate exists)
 #
-# QUIET OUTDOOR HANDLING (NEW BEHAVIOR):
-# - If QUIET_SWITCH is missing OR entity does not exist in HA:
-#     * Quiet logic is skipped entirely
-#     * Demand will jump normally from 95% to 100% via select when needed
-# - If QUIET_SWITCH exists:
-#     * "QUIET 100" intermediate level works:
-#         - <=95   -> quiet OFF, select snapped
-#         - 95-100 -> quiet ON,  select 100
-#         - >=100  -> quiet OFF, select 100 (REAL 100), BUT gated as last resort
-#
-# REAL 100% "LAST RESORT" GATING:
-# - Applies ONLY when quiet switch exists (because then "quiet 100" is available as intermediate)
-# - If quiet switch does NOT exist: no gating, normal 100% behavior.
-#
+# NEW:
+# - Hard indoor temperature guardrails via helpers:
+#     * MIN_TEMP_HELPER: below this -> heat "no matter what" (force demand up)
+#     * MAX_TEMP_HELPER: above this -> stop heating "no matter what" (force demand down)
+# - These overrides bypass Nordpool bias + ML target selection logic.
+# - Temperature override is evaluated every tick and applied immediately.
 
 import time
 from math import isfinite
@@ -58,14 +50,19 @@ DAIKINS = [
 
         "LEARNING_ENABLED_HELPER": "input_boolean.daikin1_ml_learning_enabled",
 
-        # Quiet switch for "QUIET 100" virtual level (optional; if missing, logic is skipped)
+        # Optional: quiet switch for "QUIET 100" virtual level (if missing/not existing -> skipped)
         "QUIET_SWITCH": "switch.faikin_quiet_outdoor",
 
         # Nordpool price bias helper (demand points), set by nordpool_15m_bias.py
         "PRICE_BIAS_HELPER": "input_number.daikin1_price_bias_points",
+
+        # NEW: hard temperature guardrails
+        # If helper missing/unset -> defaults mean "no guard"
+        "MIN_TEMP_HELPER": "input_number.daikin1_min_temp_guard",
+        "MAX_TEMP_HELPER": "input_number.daikin1_max_temp_guard",
     },
 
-    # Example second unit without quiet:
+    # Example unit without quiet:
     # {
     #     "name": "daikin2",
     #     "INDOOR": "sensor.toinen_sisalampo",
@@ -81,8 +78,9 @@ DAIKINS = [
     #     "STORE_ENTITY": "pyscript.daikin2_ml_params",
     #     "LEARNED_SENSOR": "sensor.daikin2_ml_learned_demand",
     #     "LEARNING_ENABLED_HELPER": "input_boolean.daikin2_ml_learning_enabled",
-    #     # no QUIET_SWITCH -> jump 95->100 normally
     #     "PRICE_BIAS_HELPER": "input_number.daikin2_price_bias_points",
+    #     "MIN_TEMP_HELPER": "input_number.daikin2_min_temp_guard",
+    #     "MAX_TEMP_HELPER": "input_number.daikin2_max_temp_guard",
     # },
 ]
 
@@ -118,6 +116,10 @@ AUTO_DB_BASE   = 0.10
 LAST_RESORT_MIN_ERR_C = 0.5
 LAST_RESORT_ERR_C = 1.5
 LAST_RESORT_MINUTES = 30
+
+# NEW: temp guard defaults (meaning "disabled" unless you set helpers)
+TEMP_GUARD_MIN_DEFAULT = -100.0
+TEMP_GUARD_MAX_DEFAULT =  100.0
 
 
 # ============================================================
@@ -297,15 +299,6 @@ def _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_curre
     step_auto_rounded = round(step_auto, 1)
     db_auto_rounded   = round(db_auto, 2)
 
-    if (abs(step_auto_rounded - step_limit_current) > 0.1 or
-            abs(db_auto_rounded - deadband_current) > 0.01):
-        log.info(
-            "Daikin ML AUTO-TUNE (%s, ctx=%s): gain=%.3f -> step_limit=%.1f (was %.1f), deadband=%.2f (was %.2f)",
-            unit_name, ctx, gain,
-            step_auto_rounded, step_limit_current,
-            db_auto_rounded,   deadband_current,
-        )
-
     return step_auto_rounded, db_auto_rounded
 
 def _avg_future_outdoor(weather_entity, outdoor_entity):
@@ -396,25 +389,18 @@ def _set_quiet(quiet_switch, turn_on, unit_name):
         cur = _quiet_is_on(quiet_switch)
         if turn_on and (not cur):
             switch.turn_on(entity_id=quiet_switch)
-            log.info("Daikin ML (%s): QUIET_SWITCH ON -> %s", unit_name, quiet_switch)
         elif (not turn_on) and cur:
             switch.turn_off(entity_id=quiet_switch)
-            log.info("Daikin ML (%s): QUIET_SWITCH OFF -> %s", unit_name, quiet_switch)
     except Exception as e:
         log.error("Daikin ML (%s): failed to set QUIET_SWITCH %s: %s", unit_name, quiet_switch, e)
 
 def _apply_demand(unit_name, select_entity, target_percent, prev_str):
-    """Plain demand apply (no quiet logic)."""
     option = _snap_to_select(select_entity, float(target_percent), 0)
     if option and option != prev_str:
         select.select_option(entity_id=select_entity, option=option)
     return option
 
 def _apply_demand_with_quiet(unit_name, select_entity, quiet_switch, target_percent, prev_str, allow_real_100):
-    """
-    Quiet-aware apply with REAL 100 gating.
-    NOTE: this function should only be used if quiet_switch exists.
-    """
     t = float(target_percent)
 
     if t >= 100.0:
@@ -448,6 +434,38 @@ def _read_price_bias_points(unit):
     except Exception:
         return 0.0
 
+def _read_temp_guard(unit):
+    """Return (min_temp, max_temp, min_ent, max_ent) using defaults if missing."""
+    min_ent = unit.get("MIN_TEMP_HELPER")
+    max_ent = unit.get("MAX_TEMP_HELPER")
+
+    min_v = TEMP_GUARD_MIN_DEFAULT
+    max_v = TEMP_GUARD_MAX_DEFAULT
+
+    if min_ent:
+        try:
+            mv = float(state.get(min_ent))
+            if isfinite(mv):
+                min_v = mv
+        except Exception:
+            pass
+
+    if max_ent:
+        try:
+            mv = float(state.get(max_ent))
+            if isfinite(mv):
+                max_v = mv
+        except Exception:
+            pass
+
+    # sanity: if user sets inverted, swap
+    if min_v > max_v:
+        tmp = min_v
+        min_v = max_v
+        max_v = tmp
+
+    return float(min_v), float(max_v), str(min_ent), str(max_ent)
+
 
 # ============================================================
 # 4) STATE (per unit)
@@ -458,7 +476,6 @@ _params_loaded     = {}
 
 _last_defrosting   = {}
 _cooldown_until    = {}
-
 _last_resort_since = {}
 
 def _persist_all_stores():
@@ -499,9 +516,6 @@ def _load_params_from_store(unit):
                     continue
     if new:
         _theta_by_unit_ctx[unit_name] = new
-        log.info("Daikin ML (%s): loaded %d contexts from %s", unit_name, len(new), store)
-    else:
-        log.info("Daikin ML (%s): no stored thetas in %s, starting fresh", unit_name, store)
 
 def _save_params_to_store(unit):
     unit_name = unit["name"]
@@ -569,8 +583,6 @@ def _ml_startup_ok():
         except Exception as e:
             log.error("Daikin ML (%s): failed to init learned demand sensor: %s", u["name"], e)
 
-    log.info("Daikin ML MULTI: startup loaded for %d unit(s)", len(DAIKINS))
-
 @time_trigger("cron(*/6 * * * *)")
 @state_trigger(*_TRIGGER_ENTITIES)
 def daikin_ml_controller(**kwargs):
@@ -622,10 +634,6 @@ def _run_one_unit(u):
     except Exception:
         rate = 0.0
     if not isfinite(rate):
-        log.warning(
-            "Daikin ML (%s): INDOOR_RATE not finite (%s) -> forcing 0.0 and skipping learning this tick",
-            unit_name, str(state.get(INDOOR_RATE))
-        )
         rate = 0.0
         rate_bad = True
     else:
@@ -656,13 +664,14 @@ def _run_one_unit(u):
         _last_defrosting[unit_name] = defrosting
     if (_last_defrosting[unit_name] is True) and (defrosting is False):
         _cooldown_until[unit_name] = now + COOLDOWN_MINUTES * 60.0
-        log.info("Daikin ML (%s): defrost ended -> cooldown active for %d min", unit_name, COOLDOWN_MINUTES)
     _last_defrosting[unit_name] = defrosting
     in_cooldown = (now < _cooldown_until[unit_name])
 
     if not (isfinite(Tin) and isfinite(Tout_raw)):
-        log.info("Daikin ML (%s): sensors not ready; Tin=%s Tout=%s", unit_name, state.get(INDOOR), state.get(OUTDOOR))
         return
+
+    # NEW: Read temperature guardrails
+    min_temp, max_temp, min_ent, max_ent = _read_temp_guard(u)
 
     Tout_bucket = int(round(Tout_raw))
     ctx = _context_key_for_outdoor(Tout_raw)
@@ -679,7 +688,6 @@ def _run_one_unit(u):
     P     = _P_by_unit_ctx[unit_name][ctx]
 
     if not _all_finite(theta):
-        log.error("Daikin ML (%s): theta not finite for ctx=%s -> resetting theta/P", unit_name, ctx)
         theta = [0.0, 0.0, 5.0, 0.0]
         P = [[P0, 0, 0, 0],
              [0, P0, 0, 0],
@@ -691,6 +699,7 @@ def _run_one_unit(u):
 
     step_limit, deadband = _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_current)
 
+    # Caps
     if Tout_bucket <= -5:
         global_upper = MAX_DEM
     else:
@@ -707,21 +716,19 @@ def _run_one_unit(u):
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
     band_upper = min(global_upper, icing_cap) if in_icing_band else global_upper
 
+    # If previous is > cap, clamp and quiet OFF
     if prev > band_upper:
         if quiet_available:
             _set_quiet(QUIET_SWITCH, False, unit_name)
         option_cap = _snap_to_select(SELECT, band_upper, -1)
         if option_cap and option_cap != prev_str:
             select.select_option(entity_id=SELECT, option=option_cap)
-            log.info(
-                "Daikin ML (%s): CAP ENFORCED: prev=%s -> %s (upper=%.0f%%, ctx=%s, Tout_bucket=%d)",
-                unit_name, prev_str, option_cap, band_upper, ctx, Tout_bucket,
-            )
         _last_resort_since[unit_name] = 0.0
         return
 
     prev_eff = prev if prev <= band_upper else band_upper
 
+    # --- ML learning update (optional) ---
     err         = sp - Tin
     demand_norm = _clip(prev_eff / 100.0, 0.0, 1.0)
     x = [1.0, err, demand_norm, (Tout_raw - Tin)]
@@ -745,15 +752,13 @@ def _run_one_unit(u):
             _P_by_unit_ctx[unit_name][ctx] = P
             _save_params_to_store(u)
         else:
-            log.error("Daikin ML (%s): theta update produced non-finite; reverting", unit_name)
-            theta = theta_prev
-            P = P_prev
-            _theta_by_unit_ctx[unit_name][ctx] = theta
-            _P_by_unit_ctx[unit_name][ctx] = P
+            _theta_by_unit_ctx[unit_name][ctx] = theta_prev
+            _P_by_unit_ctx[unit_name][ctx] = P_prev
     else:
         _theta_by_unit_ctx[unit_name][ctx] = theta
         _P_by_unit_ctx[unit_name][ctx] = P
 
+    # --- compute dem_opt ---
     Tout_future = _avg_future_outdoor(WEATHER, OUTDOOR)
     Tout_eff    = 0.5 * Tout_raw + 0.5 * Tout_future
     dTin_target = _clip(KAPPA * err / HORIZON_H, -2.0, 2.0)
@@ -775,7 +780,7 @@ def _run_one_unit(u):
 
     price_bias = _read_price_bias_points(u)
 
-    # learned sensor (attrs always updated)
+    # --- learned sensor update (attrs always updated) ---
     try:
         if learning_enabled:
             learned_value = round(float(dem_opt), 1)
@@ -808,39 +813,61 @@ def _run_one_unit(u):
             price_bias_points=round(float(price_bias), 2),
             price_bias_helper=str(PRICE_BIAS_HELPER),
             quiet_available=bool(quiet_available),
+            temp_guard_min=min_temp,
+            temp_guard_max=max_temp,
+            temp_guard_min_helper=min_ent,
+            temp_guard_max_helper=max_ent,
             note=note,
         )
     except Exception as e:
         log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
 
-    if abs(err) <= deadband:
-        dem_target = prev_eff
+    # ============================================================
+    # NEW: HARD TEMPERATURE GUARD OVERRIDE ("no matter what")
+    # ============================================================
+    # If Tin below min_temp -> force MAX demand allowed by system (100 or band_upper, whichever smaller)
+    # If Tin above max_temp -> force MIN demand (MIN_DEM)
+    #
+    # This override ignores ML target, price bias, monotonic constraint, and step limits.
+    #
+    temp_override = None
+    if isfinite(min_temp) and Tin < min_temp:
+        temp_override = "below_min"
+        dem_clip = min(100.0, float(band_upper))
+    elif isfinite(max_temp) and Tin > max_temp:
+        temp_override = "above_max"
+        dem_clip = float(MIN_DEM)
     else:
-        dem_target = dem_opt
+        # Normal control path
+        if abs(err) <= deadband:
+            dem_target = prev_eff
+        else:
+            dem_target = dem_opt
 
-    if err > deadband and dem_target < prev_eff:
-        dem_target = prev_eff
+        if err > deadband and dem_target < prev_eff:
+            dem_target = prev_eff
 
-    if abs(price_bias) > 0.0001:
-        dem_target = dem_target + price_bias
+        if abs(price_bias) > 0.0001:
+            dem_target = dem_target + price_bias
 
-    delta = dem_target - prev_eff
-    if delta > 0:
-        up_limit = COOLDOWN_STEP_UP if in_cooldown else step_limit
-        if delta > up_limit:
-            dem_target = prev_eff + up_limit
-    elif delta < 0:
-        down_limit = step_limit
-        if -delta > down_limit:
-            dem_target = prev_eff - down_limit
+        delta = dem_target - prev_eff
+        if delta > 0:
+            up_limit = COOLDOWN_STEP_UP if in_cooldown else step_limit
+            if delta > up_limit:
+                dem_target = prev_eff + up_limit
+        elif delta < 0:
+            down_limit = step_limit
+            if -delta > down_limit:
+                dem_target = prev_eff - down_limit
 
-    dem_clip = _clip(dem_target, MIN_DEM, min(band_upper, 100.0))
+        dem_clip = _clip(dem_target, MIN_DEM, min(band_upper, 100.0))
 
-    # REAL 100 last-resort gating only if quiet is available (because otherwise no intermediate exists)
+    # REAL 100 last-resort gating only if quiet is available (and only in normal control path;
+    # with temp_override below_min, we allow real 100 if needed because it's "no matter what")
     allow_real_100 = True
     want_full = (dem_clip >= 99.95) and (band_upper >= 100.0)
 
-    if quiet_available:
+    if quiet_available and (temp_override is None):
         allow_real_100 = False
         if want_full and (err > LAST_RESORT_MIN_ERR_C) and (not defrosting):
             if _last_resort_since[unit_name] <= 0.0:
@@ -852,35 +879,24 @@ def _run_one_unit(u):
                 allow_real_100 = True
         else:
             _last_resort_since[unit_name] = 0.0
+    else:
+        # If no quiet available or temp_override active, don't use last-resort timer
+        _last_resort_since[unit_name] = 0.0
 
     # Apply final command
     if quiet_available:
         option = _apply_demand_with_quiet(unit_name, SELECT, QUIET_SWITCH, dem_clip, prev_str, allow_real_100)
     else:
-        # No quiet: plain snap, jump 95->100 normally
         option = _apply_demand(unit_name, SELECT, dem_clip, prev_str)
 
-    lr_elapsed = 0.0
-    if _last_resort_since[unit_name] > 0.0:
-        lr_elapsed = now - _last_resort_since[unit_name]
-
     log.info(
-        "Daikin ML (%s): ctx=%s | Tin=%.2f°C, Tout=%.2f°C (bucket=%d, →%.1f°C), "
-        "DEFROST=%s, cooldown=%s, learning_enabled=%s, learning_allowed=%s, rate_bad=%s, "
-        "band_upper=%.0f%%, quiet_available=%s | "
-        "SP=%.2f, step_limit=%.1f, deadband=%.2f | "
-        "price_bias=%.2f pts | "
-        "last_resort: want_full=%s allow_real_100=%s elapsed=%.0fs | "
-        "prev=%s (quiet_prev=%s) → opt≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s (quiet_now=%s)",
-        unit_name, ctx, Tin, Tout_raw, Tout_bucket, Tout_future,
-        str(defrosting), ("ACTIVE" if in_cooldown else "off"),
-        str(learning_enabled), str(allow_learning), str(rate_bad),
+        "Daikin ML (%s): ctx=%s Tin=%.2f Tout=%.2f sp=%.2f err=%.2f | temp_guard=[%.2f..%.2f] override=%s | "
+        "band_upper=%.0f quiet_avail=%s | dem_opt=%.1f price_bias=%.2f -> dem_clip=%.1f -> %s",
+        unit_name, ctx, Tin, Tout_raw, sp, err,
+        min_temp, max_temp, str(temp_override),
         band_upper, str(quiet_available),
-        sp, step_limit, deadband,
-        float(price_bias),
-        str(want_full), str(allow_real_100), float(lr_elapsed),
-        prev_str, str(quiet_prev), dem_opt, dem_target, dem_clip, option,
-        str(_quiet_is_on(QUIET_SWITCH) if quiet_available else False),
+        float(dem_opt), float(price_bias),
+        float(dem_clip), str(option),
     )
 
 
@@ -901,7 +917,6 @@ def daikin_ml_reset():
         unit_name = u["name"]
         _init_unit_if_needed(unit_name)
 
-        old_cnt = len(_theta_by_unit_ctx.get(unit_name) or {})
         _theta_by_unit_ctx[unit_name] = {}
         _P_by_unit_ctx[unit_name] = {}
         _params_loaded[unit_name] = False
@@ -911,10 +926,6 @@ def daikin_ml_reset():
 
         try:
             state.set(u["STORE_ENTITY"], value=time.time(), theta_by_ctx={})
-            log.warning(
-                "Daikin ML RESET (%s): cleared %d learned contexts, theta_by_ctx now empty in %s",
-                unit_name, old_cnt, u["STORE_ENTITY"],
-            )
         except Exception as e:
             log.error("Daikin ML RESET (%s): error resetting params in %s: %s", unit_name, u["STORE_ENTITY"], e)
 
@@ -928,7 +939,6 @@ def daikin_ml_learning_enable():
     """Enable learning globally."""
     try:
         input_boolean.turn_on(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
-        log.info("Daikin ML: learning enabled (global) -> %s", LEARNING_ENABLED_HELPER_GLOBAL)
     except Exception as e:
         log.error("Daikin ML: failed to enable learning global: %s", e)
 
@@ -937,7 +947,6 @@ def daikin_ml_learning_disable():
     """Disable learning globally."""
     try:
         input_boolean.turn_off(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
-        log.info("Daikin ML: learning disabled (global) -> %s", LEARNING_ENABLED_HELPER_GLOBAL)
     except Exception as e:
         log.error("Daikin ML: failed to disable learning global: %s", e)
 
@@ -949,10 +958,8 @@ def daikin_ml_learning_toggle():
         cur_on = (str(cur).strip().lower() == "on")
         if cur_on:
             input_boolean.turn_off(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
-            log.info("Daikin ML: learning toggled OFF (global)")
         else:
             input_boolean.turn_on(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
-            log.info("Daikin ML: learning toggled ON (global)")
     except Exception as e:
         log.error("Daikin ML: failed to toggle learning global: %s", e)
 
