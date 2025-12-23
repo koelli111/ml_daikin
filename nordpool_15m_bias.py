@@ -4,21 +4,21 @@
 #
 # Supports multiple sensor attribute structures:
 #
-# A) Original
-#   state = current price
-#   attributes.records:
-#     - Time: '2025-12-22T00:00:00'
-#       End:  '2025-12-22T00:15:00'
+# A) attributes.records:
+#     - Time:  '2025-12-22T00:00:00'
+#       End:   '2025-12-22T00:15:00'
 #       Price: 5.45
 #
-# B) New structure
-#   attributes.raw_today:
+# B) attributes.raw_today / raw_tomorrow:
 #     - start: '2025-12-23T00:00:00+02:00'
 #       end:   '2025-12-23T00:15:00+02:00'
 #       value: 7.64
 #
 # Average window (hours) via input_number helper:
 #   input_number.nordpool_avg_window_hours
+#
+# Enable switch (optional):
+#   input_boolean.nordpool_bias_enabled
 #
 # Writes debug sensors:
 #   sensor.nordpool_15m_avg_price
@@ -28,6 +28,7 @@
 #   sensor.nordpool_15m_record_count
 #   sensor.nordpool_15m_avg_window_hours
 #   sensor.nordpool_15m_source_format
+#   sensor.nordpool_15m_bias_enabled_state   <-- NEW
 #
 # Writes per-unit bias helpers:
 #   input_number.daikin1_price_bias_points
@@ -65,7 +66,7 @@ UNIT_BIAS_HELPERS = {
 MAX_BIAS_POINTS = 20.0      # maximum +/- demand points
 REL_AT_MAX = 0.50           # rel=+0.50 (50% above avg) => full negative bias
 REL_DEADBAND = 0.05         # +-5% around average => no bias
-EMA_ALPHA = 0.30            # smoothing for rel: new = alpha*now + (1-alpha)*prev. Set 1.0 to disable.
+EMA_ALPHA = 0.30            # smoothing for rel
 MIN_AVG_PRICE = 0.0001      # safety
 
 # Update cadence: run each minute + on sensor change
@@ -79,6 +80,7 @@ S_NOW = "sensor.nordpool_15m_now_price"
 S_REC_COUNT = "sensor.nordpool_15m_record_count"
 S_WIN_H = "sensor.nordpool_15m_avg_window_hours"
 S_FMT = "sensor.nordpool_15m_source_format"
+S_EN = "sensor.nordpool_15m_bias_enabled_state"   # NEW
 
 # Store for EMA
 STATE_STORE = "pyscript.nordpool_15m_bias_store"
@@ -101,20 +103,35 @@ def _clip(v, lo, hi):
     return vf
 
 def _read_bool(entity_id, default=True):
+    """
+    Robust HA boolean parsing:
+      - Only known "off" strings => False
+      - Only known "on" strings  => True
+      - Otherwise: return default if state is missing/unavailable/unknown, else True
+    """
     if not entity_id:
         return default
     try:
-        s = state.get(entity_id)
+        raw = state.get(entity_id)
     except Exception:
         return default
-    if s is None:
+
+    if raw is None:
         return default
-    ss = str(s).strip().lower()
-    if ss in ("on", "true", "1", "yes", "enabled"):
-        return True
+
+    ss = str(raw).strip().lower()
+
     if ss in ("off", "false", "0", "no", "disabled"):
         return False
-    return default
+    if ss in ("on", "true", "1", "yes", "enabled"):
+        return True
+
+    # Treat HA "unknown/unavailable" as default
+    if ss in ("unknown", "unavailable", ""):
+        return default
+
+    # Anything else -> True (safer: don’t accidentally disable bias)
+    return True
 
 def _safe_float(x, default=None):
     try:
@@ -142,7 +159,6 @@ def _parse_iso_dt(s):
         return None
 
 def _normalize_dt_pair(record_dt, now_dt):
-    # Normalize tz mismatch (naive vs aware) by making both naive
     if record_dt is None:
         return None, now_dt
     if (record_dt.tzinfo is None) != (now_dt.tzinfo is None):
@@ -158,18 +174,15 @@ def _in_window(record_time_dt, now_dt, window_hours):
     return (delta.total_seconds() >= 0) and (delta.total_seconds() <= window_hours * 3600.0)
 
 def _detect_source_format(attrs):
-    # Prefer records if it exists and is list; otherwise raw_today if it exists and is list.
     rec = attrs.get("records")
     if isinstance(rec, list) and len(rec) > 0:
         return "records"
     rt = attrs.get("raw_today")
     if isinstance(rt, list) and len(rt) > 0:
         return "raw_today"
-    # Try raw_tomorrow too (some sensors split)
     rtom = attrs.get("raw_tomorrow")
     if isinstance(rtom, list) and len(rtom) > 0:
         return "raw_tomorrow"
-    # Fallback: if any of them exist but empty
     if isinstance(rec, list):
         return "records_empty"
     if isinstance(rt, list):
@@ -182,7 +195,6 @@ def _extract_prices_from_records_window(records, now_dt, window_hours):
     prices = []
     count_total = 0
     count_in_window = 0
-
     if not isinstance(records, list):
         return prices, count_total, count_in_window
 
@@ -204,7 +216,6 @@ def _extract_prices_from_raw_window(raw_list, now_dt, window_hours, time_key, va
     prices = []
     count_total = 0
     count_in_window = 0
-
     if not isinstance(raw_list, list):
         return prices, count_total, count_in_window
 
@@ -232,8 +243,7 @@ def _calc_avg(prices):
 
 def _get_prev_rel():
     attrs = state.getattr(STATE_STORE) or {}
-    prev = _safe_float(attrs.get("rel_ema"), default=None)
-    return prev
+    return _safe_float(attrs.get("rel_ema"), default=None)
 
 def _set_prev_rel(rel_ema):
     try:
@@ -272,7 +282,7 @@ def _set_input_number(entity_id, value):
     except Exception as e:
         log.debug("Nordpool bias: could not set %s (create it in HA?). err=%s", entity_id, e)
 
-def _update_debug_sensors(price_now, avg_price, rel_now, rel_ema, bias, total_count, in_window_count, window_hours, fmt):
+def _update_debug_sensors(price_now, avg_price, rel_now, rel_ema, bias, total_count, in_window_count, window_hours, fmt, en_raw, en_parsed):
     try:
         state.set(S_NOW, value=round(float(price_now), 6))
         state.set(S_AVG, value=round(float(avg_price), 6),
@@ -287,6 +297,10 @@ def _update_debug_sensors(price_now, avg_price, rel_now, rel_ema, bias, total_co
         state.set(S_REC_COUNT, value=int(in_window_count), total=int(total_count))
         state.set(S_WIN_H, value=round(float(window_hours), 2), helper=AVG_WINDOW_HOURS_HELPER)
         state.set(S_FMT, value=str(fmt))
+        state.set(S_EN, value=("on" if en_parsed else "off"),
+                  entity=str(BIAS_ENABLED_SWITCH),
+                  raw=str(en_raw),
+                  parsed=bool(en_parsed))
     except Exception as e:
         log.error("Nordpool bias: failed to update debug sensors: %s", e)
 
@@ -296,24 +310,31 @@ def _update_debug_sensors(price_now, avg_price, rel_now, rel_ema, bias, total_co
 # ----------------------------
 def _update_nordpool_bias():
     # enable switch (optional)
+    en_raw = None
     if BIAS_ENABLED_SWITCH:
+        try:
+            en_raw = state.get(BIAS_ENABLED_SWITCH)
+        except Exception:
+            en_raw = None
         enabled = _read_bool(BIAS_ENABLED_SWITCH, default=True)
+
         if not enabled:
             for unit, helper in UNIT_BIAS_HELPERS.items():
                 _set_input_number(helper, 0.0)
             try:
-                state.set(S_BIAS, value=0.0, note="disabled")
+                state.set(S_BIAS, value=0.0, note="disabled", entity=str(BIAS_ENABLED_SWITCH), raw=str(en_raw))
+                state.set(S_EN, value="off", entity=str(BIAS_ENABLED_SWITCH), raw=str(en_raw), parsed=False)
             except Exception:
                 pass
             return
+    else:
+        enabled = True
 
     attrs = state.getattr(PRICE_SENSOR) or {}
-
-    # current price: prefer sensor state, fallback to first record in the closest-to-now slot (if state missing)
     price_now = _safe_float(state.get(PRICE_SENSOR), default=None)
 
     window_hours = _read_avg_window_hours()
-    now_dt = datetime.now(timezone.utc).astimezone()  # local tz aware
+    now_dt = datetime.now(timezone.utc).astimezone()
 
     fmt = _detect_source_format(attrs)
 
@@ -324,27 +345,22 @@ def _update_nordpool_bias():
     if fmt.startswith("records"):
         rec = attrs.get("records") or []
         prices, total_count, in_window_count = _extract_prices_from_records_window(rec, now_dt, window_hours)
-
-        # fallback current price from first in-window record if state missing
         if price_now is None and prices:
             price_now = prices[0]
 
     elif fmt.startswith("raw_today"):
         rt = attrs.get("raw_today") or []
         prices, total_count, in_window_count = _extract_prices_from_raw_window(rt, now_dt, window_hours, "start", "value")
-
         if price_now is None and prices:
             price_now = prices[0]
 
     elif fmt.startswith("raw_tomorrow"):
         rtom = attrs.get("raw_tomorrow") or []
         prices, total_count, in_window_count = _extract_prices_from_raw_window(rtom, now_dt, window_hours, "start", "value")
-
         if price_now is None and prices:
             price_now = prices[0]
 
     else:
-        # try both if unknown
         rec = attrs.get("records")
         if isinstance(rec, list):
             prices, total_count, in_window_count = _extract_prices_from_records_window(rec, now_dt, window_hours)
@@ -354,18 +370,15 @@ def _update_nordpool_bias():
             if isinstance(rt, list):
                 prices, total_count, in_window_count = _extract_prices_from_raw_window(rt, now_dt, window_hours, "start", "value")
                 fmt = "raw_today_fallback"
-
         if price_now is None and prices:
             price_now = prices[0]
 
     if price_now is None:
-        log.warning("Nordpool bias: %s state not a finite number and no usable record fallback. state=%s fmt=%s",
+        log.warning("Nordpool bias: %s state not finite and no usable record fallback. state=%s fmt=%s",
                     PRICE_SENSOR, str(state.get(PRICE_SENSOR)), fmt)
         return
 
     avg_price = _calc_avg(prices)
-
-    # Fallback if no prices in window: avg = now -> neutral
     if avg_price is None or (not isfinite(avg_price)):
         avg_price = float(price_now)
         in_window_count = 0
@@ -375,11 +388,13 @@ def _update_nordpool_bias():
     for unit, helper in UNIT_BIAS_HELPERS.items():
         _set_input_number(helper, bias)
 
-    _update_debug_sensors(price_now, avg_price, rel_now, rel_ema, bias, total_count, in_window_count, window_hours, fmt)
+    _update_debug_sensors(price_now, avg_price, rel_now, rel_ema, bias,
+                          total_count, in_window_count, window_hours, fmt,
+                          en_raw, enabled)
 
     log.info(
-        "Nordpool bias: fmt=%s win=%.2fh now=%.4f avg=%.4f rel_now=%.3f rel_ema=%.3f -> bias=%.2f pts (in_window=%d total=%d)",
-        str(fmt), float(window_hours), float(price_now), float(avg_price),
+        "Nordpool bias: enabled=%s raw=%s fmt=%s win=%.2fh now=%.4f avg=%.4f rel_now=%.3f rel_ema=%.3f -> bias=%.2f pts (in_window=%d total=%d)",
+        str(enabled), str(en_raw), str(fmt), float(window_hours), float(price_now), float(avg_price),
         float(rel_now), float(rel_ema), float(bias),
         int(in_window_count), int(total_count)
     )
@@ -396,8 +411,8 @@ def nordpool_bias_startup():
         pass
     _update_nordpool_bias()
 
-@time_trigger(CRON_EXPR)
-@state_trigger(PRICE_SENSOR, AVG_WINDOW_HOURS_HELPER)
+@time_trigger("cron(* * * * *)")
+@state_trigger(PRICE_SENSOR, AVG_WINDOW_HOURS_HELPER, BIAS_ENABLED_SWITCH)
 def nordpool_bias_update(**kwargs):
     _update_nordpool_bias()
 
