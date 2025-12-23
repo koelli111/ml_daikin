@@ -5,22 +5,25 @@
 # - Multi-daikin support (DAIKINS list)
 # - NaN/inf guards (rate/x/y/theta/dem_opt, store load/save ignores non-finite)
 # - Learning enable switch (global + per-unit override)
-# - OPTION A:
-#     * When learning is enabled -> learned-demand sensor value follows dem_opt
-#     * When learning is disabled -> learned-demand sensor value is FROZEN,
-#       but attributes are still updated every tick (so debug attrs don't disappear)
-# - "QUIET 100" intermediate level:
-#     * demand <= 95  -> quiet OFF, select snapped
-#     * 95 < demand < 100 -> select 100 + quiet ON  (virtual level)
-#     * demand >= 100 -> select 100 + quiet OFF     (real max)
-# - Nord Pool 15-min price bias integration (per-unit input_number bias points):
-#     * Reads u["PRICE_BIAS_HELPER"] (e.g. input_number.daikin1_price_bias_points)
-#     * Adds bias (demand points) to dem_target AFTER monotonic constraint,
-#       BEFORE step limiting + final clip/snap.
+# - OPTION A (improved):
+#     * learning enabled  -> learned-demand sensor value follows dem_opt
+#     * learning disabled -> learned-demand sensor value frozen, attributes updated every tick
+# - Nord Pool 15-min price bias integration (per-unit input_number bias points)
 #
-# NOTE:
-# - Controller clips to band_upper (e.g. 95 in mild weather), so price bias cannot push above the cap
-#   unless your existing caps allow it. Quiet-100 only activates when dem_clip > 95 and < 100.
+# QUIET OUTDOOR HANDLING (NEW BEHAVIOR):
+# - If QUIET_SWITCH is missing OR entity does not exist in HA:
+#     * Quiet logic is skipped entirely
+#     * Demand will jump normally from 95% to 100% via select when needed
+# - If QUIET_SWITCH exists:
+#     * "QUIET 100" intermediate level works:
+#         - <=95   -> quiet OFF, select snapped
+#         - 95-100 -> quiet ON,  select 100
+#         - >=100  -> quiet OFF, select 100 (REAL 100), BUT gated as last resort
+#
+# REAL 100% "LAST RESORT" GATING:
+# - Applies ONLY when quiet switch exists (because then "quiet 100" is available as intermediate)
+# - If quiet switch does NOT exist: no gating, normal 100% behavior.
+#
 
 import time
 from math import isfinite
@@ -55,14 +58,14 @@ DAIKINS = [
 
         "LEARNING_ENABLED_HELPER": "input_boolean.daikin1_ml_learning_enabled",
 
-        # Quiet switch for "QUIET 100" virtual level
+        # Quiet switch for "QUIET 100" virtual level (optional; if missing, logic is skipped)
         "QUIET_SWITCH": "switch.faikin_quiet_outdoor",
 
         # Nordpool price bias helper (demand points), set by nordpool_15m_bias.py
         "PRICE_BIAS_HELPER": "input_number.daikin1_price_bias_points",
     },
 
-    # Example second unit:
+    # Example second unit without quiet:
     # {
     #     "name": "daikin2",
     #     "INDOOR": "sensor.toinen_sisalampo",
@@ -78,7 +81,7 @@ DAIKINS = [
     #     "STORE_ENTITY": "pyscript.daikin2_ml_params",
     #     "LEARNED_SENSOR": "sensor.daikin2_ml_learned_demand",
     #     "LEARNING_ENABLED_HELPER": "input_boolean.daikin2_ml_learning_enabled",
-    #     "QUIET_SWITCH": "switch.toinen_quiet_outdoor",
+    #     # no QUIET_SWITCH -> jump 95->100 normally
     #     "PRICE_BIAS_HELPER": "input_number.daikin2_price_bias_points",
     # },
 ]
@@ -94,7 +97,7 @@ MIN_DEM    = 30.0
 MAX_DEM    = 100.0
 KAPPA      = 1.0
 
-GLOBAL_MILD_MAX = 95.0  # normal max without "quiet 100" trick
+GLOBAL_MILD_MAX = 95.0
 
 COOLDOWN_MINUTES  = 15
 COOLDOWN_STEP_UP  = 3.0
@@ -110,6 +113,11 @@ AUTO_STEP_BASE = 10.0
 AUTO_DB_MIN    = 0.05
 AUTO_DB_MAX    = 0.50
 AUTO_DB_BASE   = 0.10
+
+# REAL 100% last resort gating (ONLY when quiet switch exists)
+LAST_RESORT_MIN_ERR_C = 0.5
+LAST_RESORT_ERR_C = 1.5
+LAST_RESORT_MINUTES = 30
 
 
 # ============================================================
@@ -360,8 +368,19 @@ def _learning_enabled_for_unit(unit):
     except Exception:
         return True
 
+def _entity_exists(entity_id):
+    if not entity_id:
+        return False
+    try:
+        s = state.get(entity_id)
+    except Exception:
+        return False
+    return s is not None and str(s) != "unknown"
+
 def _quiet_is_on(quiet_switch):
     if not quiet_switch:
+        return False
+    if not _entity_exists(quiet_switch):
         return False
     try:
         return str(state.get(quiet_switch)).strip().lower() == "on"
@@ -370,6 +389,8 @@ def _quiet_is_on(quiet_switch):
 
 def _set_quiet(quiet_switch, turn_on, unit_name):
     if not quiet_switch:
+        return
+    if not _entity_exists(quiet_switch):
         return
     try:
         cur = _quiet_is_on(quiet_switch)
@@ -382,18 +403,27 @@ def _set_quiet(quiet_switch, turn_on, unit_name):
     except Exception as e:
         log.error("Daikin ML (%s): failed to set QUIET_SWITCH %s: %s", unit_name, quiet_switch, e)
 
-def _apply_demand_with_quiet(unit_name, select_entity, quiet_switch, target_percent, prev_str):
+def _apply_demand(unit_name, select_entity, target_percent, prev_str):
+    """Plain demand apply (no quiet logic)."""
+    option = _snap_to_select(select_entity, float(target_percent), 0)
+    if option and option != prev_str:
+        select.select_option(entity_id=select_entity, option=option)
+    return option
+
+def _apply_demand_with_quiet(unit_name, select_entity, quiet_switch, target_percent, prev_str, allow_real_100):
     """
-    Apply final demand to select + quiet switch:
-      - target <= 95 -> quiet OFF, select snapped
-      - 95 < target < 100 -> quiet ON, select "100%"
-      - target >= 100 -> quiet OFF, select "100%" (real max)
+    Quiet-aware apply with REAL 100 gating.
+    NOTE: this function should only be used if quiet_switch exists.
     """
     t = float(target_percent)
 
     if t >= 100.0:
-        _set_quiet(quiet_switch, False, unit_name)
-        option = _snap_to_select(select_entity, 100.0, 0)
+        if allow_real_100:
+            _set_quiet(quiet_switch, False, unit_name)
+            option = _snap_to_select(select_entity, 100.0, 0)
+        else:
+            _set_quiet(quiet_switch, True, unit_name)
+            option = _snap_to_select(select_entity, 100.0, 0)
     elif t > GLOBAL_MILD_MAX:
         _set_quiet(quiet_switch, True, unit_name)
         option = _snap_to_select(select_entity, 100.0, 0)
@@ -407,7 +437,6 @@ def _apply_demand_with_quiet(unit_name, select_entity, quiet_switch, target_perc
     return option
 
 def _read_price_bias_points(unit):
-    """Read per-unit price bias (demand points). Missing/invalid -> 0.0"""
     ent = unit.get("PRICE_BIAS_HELPER")
     if not ent:
         return 0.0
@@ -430,6 +459,8 @@ _params_loaded     = {}
 _last_defrosting   = {}
 _cooldown_until    = {}
 
+_last_resort_since = {}
+
 def _persist_all_stores():
     for u in DAIKINS:
         try:
@@ -448,6 +479,8 @@ def _init_unit_if_needed(unit_name):
         _last_defrosting[unit_name] = None
     if unit_name not in _cooldown_until:
         _cooldown_until[unit_name] = 0.0
+    if unit_name not in _last_resort_since:
+        _last_resort_since[unit_name] = 0.0
 
 def _load_params_from_store(unit):
     unit_name = unit["name"]
@@ -525,7 +558,6 @@ for u in DAIKINS:
 def _ml_startup_ok():
     for u in DAIKINS:
         _init_context_params_if_needed(u)
-        # Initialize sensor once (we will keep it updated every tick later anyway)
         try:
             state.set(
                 u["LEARNED_SENSOR"],
@@ -562,7 +594,10 @@ def _run_one_unit(u):
     WEATHER = u["WEATHER"]
     SELECT = u["SELECT"]
     LIQUID = u["LIQUID"]
+
     QUIET_SWITCH = u.get("QUIET_SWITCH")
+    quiet_available = _entity_exists(QUIET_SWITCH) if QUIET_SWITCH else False
+
     PRICE_BIAS_HELPER = u.get("PRICE_BIAS_HELPER")
 
     SP_HELPER = u["SP_HELPER"]
@@ -606,7 +641,7 @@ def _run_one_unit(u):
     except Exception:
         prev = 60.0
 
-    quiet_prev = _quiet_is_on(QUIET_SWITCH)
+    quiet_prev = _quiet_is_on(QUIET_SWITCH) if quiet_available else False
 
     try:
         liquid = float(state.get(LIQUID) or 100.0)
@@ -656,13 +691,11 @@ def _run_one_unit(u):
 
     step_limit, deadband = _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_current)
 
-    # Global upper rule
     if Tout_bucket <= -5:
         global_upper = MAX_DEM
     else:
         global_upper = GLOBAL_MILD_MAX
 
-    # Icing cap
     try:
         icing_cap = float(state.get(ICING_CAP_HELPER) or ICING_BAND_CAP_DEFAULT)
     except Exception:
@@ -674,9 +707,9 @@ def _run_one_unit(u):
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
     band_upper = min(global_upper, icing_cap) if in_icing_band else global_upper
 
-    # If previous is > cap, clamp and quiet OFF
     if prev > band_upper:
-        _set_quiet(QUIET_SWITCH, False, unit_name)
+        if quiet_available:
+            _set_quiet(QUIET_SWITCH, False, unit_name)
         option_cap = _snap_to_select(SELECT, band_upper, -1)
         if option_cap and option_cap != prev_str:
             select.select_option(entity_id=SELECT, option=option_cap)
@@ -684,6 +717,7 @@ def _run_one_unit(u):
                 "Daikin ML (%s): CAP ENFORCED: prev=%s -> %s (upper=%.0f%%, ctx=%s, Tout_bucket=%d)",
                 unit_name, prev_str, option_cap, band_upper, ctx, Tout_bucket,
             )
+        _last_resort_since[unit_name] = 0.0
         return
 
     prev_eff = prev if prev <= band_upper else band_upper
@@ -719,10 +753,6 @@ def _run_one_unit(u):
     else:
         _theta_by_unit_ctx[unit_name][ctx] = theta
         _P_by_unit_ctx[unit_name][ctx] = P
-        log.debug(
-            "Daikin ML (%s): learning paused (learning_enabled=%s, defrost=%s, cooldown=%s, rate_bad=%s, ctx=%s)",
-            unit_name, str(learning_enabled), defrosting, in_cooldown, rate_bad, ctx,
-        )
 
     Tout_future = _avg_future_outdoor(WEATHER, OUTDOOR)
     Tout_eff    = 0.5 * Tout_raw + 0.5 * Tout_future
@@ -741,15 +771,11 @@ def _run_one_unit(u):
 
     dem_opt = _clip((num / (denom_mag * denom_sign)) * 100.0, 0.0, 100.0)
     if not isfinite(dem_opt):
-        log.error("Daikin ML (%s): dem_opt non-finite (ctx=%s) -> fallback prev_eff=%.1f", unit_name, ctx, prev_eff)
         dem_opt = prev_eff
 
-    # Read Nordpool bias early so it's available for sensor attrs and control
     price_bias = _read_price_bias_points(u)
 
-    # OPTION A (improved):
-    # - learning enabled: sensor value follows dem_opt
-    # - learning disabled: sensor value frozen, BUT attributes updated every tick
+    # learned sensor (attrs always updated)
     try:
         if learning_enabled:
             learned_value = round(float(dem_opt), 1)
@@ -781,26 +807,23 @@ def _run_one_unit(u):
             learning_allowed=bool(allow_learning),
             price_bias_points=round(float(price_bias), 2),
             price_bias_helper=str(PRICE_BIAS_HELPER),
+            quiet_available=bool(quiet_available),
             note=note,
         )
     except Exception as e:
         log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
 
-    # deadband
     if abs(err) <= deadband:
         dem_target = prev_eff
     else:
         dem_target = dem_opt
 
-    # monotonic: if cold side, don't decrease
     if err > deadband and dem_target < prev_eff:
         dem_target = prev_eff
 
-    # apply Nordpool price bias (demand points) AFTER monotonic constraint
     if abs(price_bias) > 0.0001:
         dem_target = dem_target + price_bias
 
-    # step limits (price bias is included in delta here)
     delta = dem_target - prev_eff
     if delta > 0:
         up_limit = COOLDOWN_STEP_UP if in_cooldown else step_limit
@@ -811,29 +834,53 @@ def _run_one_unit(u):
         if -delta > down_limit:
             dem_target = prev_eff - down_limit
 
-    # final cap: keep logical cap at band_upper (so no >95 unless allowed by band_upper)
     dem_clip = _clip(dem_target, MIN_DEM, min(band_upper, 100.0))
 
-    # Apply demand with quiet-intermediate logic
-    option = _apply_demand_with_quiet(unit_name, SELECT, QUIET_SWITCH, dem_clip, prev_str)
+    # REAL 100 last-resort gating only if quiet is available (because otherwise no intermediate exists)
+    allow_real_100 = True
+    want_full = (dem_clip >= 99.95) and (band_upper >= 100.0)
 
-    theta_str = "[" + ", ".join([str(round(float(v), 4)) for v in theta]) + "]"
-    cool_str  = "ACTIVE" if in_cooldown else "off"
-    icing_str = "ON" if in_icing_band else "off"
+    if quiet_available:
+        allow_real_100 = False
+        if want_full and (err > LAST_RESORT_MIN_ERR_C) and (not defrosting):
+            if _last_resort_since[unit_name] <= 0.0:
+                _last_resort_since[unit_name] = now
+            elapsed = now - _last_resort_since[unit_name]
+            if err >= LAST_RESORT_ERR_C:
+                allow_real_100 = True
+            elif elapsed >= (LAST_RESORT_MINUTES * 60.0):
+                allow_real_100 = True
+        else:
+            _last_resort_since[unit_name] = 0.0
+
+    # Apply final command
+    if quiet_available:
+        option = _apply_demand_with_quiet(unit_name, SELECT, QUIET_SWITCH, dem_clip, prev_str, allow_real_100)
+    else:
+        # No quiet: plain snap, jump 95->100 normally
+        option = _apply_demand(unit_name, SELECT, dem_clip, prev_str)
+
+    lr_elapsed = 0.0
+    if _last_resort_since[unit_name] > 0.0:
+        lr_elapsed = now - _last_resort_since[unit_name]
 
     log.info(
         "Daikin ML (%s): ctx=%s | Tin=%.2f°C, Tout=%.2f°C (bucket=%d, →%.1f°C), "
         "DEFROST=%s, cooldown=%s, learning_enabled=%s, learning_allowed=%s, rate_bad=%s, "
-        "icing_band=%s, band_upper=%.0f%%, theta=%s | "
+        "band_upper=%.0f%%, quiet_available=%s | "
         "SP=%.2f, step_limit=%.1f, deadband=%.2f | "
-        "price_bias=%.2f pts (%s) | "
-        "prev=%s (quiet=%s) → opt≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s (quiet_now=%s)",
+        "price_bias=%.2f pts | "
+        "last_resort: want_full=%s allow_real_100=%s elapsed=%.0fs | "
+        "prev=%s (quiet_prev=%s) → opt≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s (quiet_now=%s)",
         unit_name, ctx, Tin, Tout_raw, Tout_bucket, Tout_future,
-        str(defrosting), cool_str, str(learning_enabled), str(allow_learning), str(rate_bad),
-        icing_str, band_upper, theta_str,
+        str(defrosting), ("ACTIVE" if in_cooldown else "off"),
+        str(learning_enabled), str(allow_learning), str(rate_bad),
+        band_upper, str(quiet_available),
         sp, step_limit, deadband,
-        float(price_bias), str(PRICE_BIAS_HELPER),
-        prev_str, str(quiet_prev), dem_opt, dem_target, dem_clip, option, str(_quiet_is_on(QUIET_SWITCH)),
+        float(price_bias),
+        str(want_full), str(allow_real_100), float(lr_elapsed),
+        prev_str, str(quiet_prev), dem_opt, dem_target, dem_clip, option,
+        str(_quiet_is_on(QUIET_SWITCH) if quiet_available else False),
     )
 
 
@@ -848,7 +895,7 @@ def daikin_ml_step():
 @service
 def daikin_ml_reset():
     """Reset learning for all units."""
-    global _theta_by_unit_ctx, _P_by_unit_ctx, _params_loaded, _last_defrosting, _cooldown_until
+    global _theta_by_unit_ctx, _P_by_unit_ctx, _params_loaded, _last_defrosting, _cooldown_until, _last_resort_since
 
     for u in DAIKINS:
         unit_name = u["name"]
@@ -860,6 +907,7 @@ def daikin_ml_reset():
         _params_loaded[unit_name] = False
         _last_defrosting[unit_name] = None
         _cooldown_until[unit_name] = 0.0
+        _last_resort_since[unit_name] = 0.0
 
         try:
             state.set(u["STORE_ENTITY"], value=time.time(), theta_by_ctx={})
