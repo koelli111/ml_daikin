@@ -97,7 +97,7 @@ KAPPA      = 1.0
 
 GLOBAL_MILD_MAX = 95.0
 
-COOLDOWN_MINUTES  = 15
+COOLDOWN_MINUTES  = 30
 COOLDOWN_STEP_UP  = 3.0
 
 ICING_BAND_MIN = -2.0
@@ -662,8 +662,16 @@ def _run_one_unit(u):
     now = time.time()
     if _last_defrosting[unit_name] is None:
         _last_defrosting[unit_name] = defrosting
-    if (_last_defrosting[unit_name] is True) and (defrosting is False):
+
+    # ============================================================
+    # CHANGE (ONLY): cooldown starts at BEGINNING of defrost
+    # Old:
+    # if (_last_defrosting[unit_name] is True) and (defrosting is False):
+    #     _cooldown_until[unit_name] = now + COOLDOWN_MINUTES * 60.0
+    # ============================================================
+    if (_last_defrosting[unit_name] is False) and (defrosting is True):
         _cooldown_until[unit_name] = now + COOLDOWN_MINUTES * 60.0
+
     _last_defrosting[unit_name] = defrosting
     in_cooldown = (now < _cooldown_until[unit_name])
 
