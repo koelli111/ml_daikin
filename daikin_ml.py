@@ -567,7 +567,7 @@ _persist_all_stores()
 
 _TRIGGER_ENTITIES = []
 for u in DAIKINS:
-    for k in ("INDOOR", "OUTDOOR", "INDOOR_RATE", "LIQUID"):
+    for k in ("INDOOR", "OUTDOOR", "INDOOR_RATE"):
         ent = u.get(k)
         if ent:
             _TRIGGER_ENTITIES.append(ent)
