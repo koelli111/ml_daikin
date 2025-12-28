@@ -1,0 +1,47 @@
+type: custom:plotly-graph
+title: Daikin setpoint vs Nord Pool price
+hours_to_show: 48
+refresh_interval: 30
+layout:
+  showlegend: true
+  margin:
+    l: 55
+    r: 65
+    t: 30
+    b: 35
+  xaxis:
+    title: Time
+  yaxis:
+    title: Setpoint (°C)
+    rangemode: normal
+  yaxis2:
+    title: Nord Pool price / Bias
+    overlaying: "y"
+    side: right
+    rangemode: normal
+entities:
+  - entity: input_number.daikin_setpoint_base
+    name: Base setpoint
+    line:
+      width: 2
+    show_value: true
+  - entity: input_number.daikin_setpoint
+    name: Effective setpoint (biased)
+    line:
+      width: 3
+    show_value: true
+  - entity: sensor.day_ahead_price
+    name: Nord Pool price
+    yaxis: y2
+    mode: lines
+    line:
+      width: 2
+    show_value: true
+  - entity: input_number.daikin1_price_bias_points
+    name: Nord Pool bias points
+    yaxis: y2
+    mode: lines
+    line:
+      width: 2
+      dash: dot
+    show_value: true
