@@ -16,6 +16,13 @@
 #     * MAX_TEMP_HELPER: above this -> stop heating "no matter what" (force demand down)
 # - These overrides bypass Nordpool bias + ML target selection logic.
 # - Temperature override is evaluated every tick and applied immediately.
+#
+# CHANGES already applied previously:
+# - Cooldown starts at the beginning of the defrost.
+# - Prevent jumping above icing cap (snap DOWN when cap-limited).
+#
+# NEW FEATURE ADDED NOW:
+# - Confidence scoring & auto-freeze (blend ML output based on confidence per ctx)
 
 import time
 from math import isfinite
@@ -120,6 +127,21 @@ LAST_RESORT_MINUTES = 30
 # NEW: temp guard defaults (meaning "disabled" unless you set helpers)
 TEMP_GUARD_MIN_DEFAULT = -100.0
 TEMP_GUARD_MAX_DEFAULT =  100.0
+
+# ============================================================
+# NEW FEATURE: Confidence scoring & auto-freeze (blend)
+# ============================================================
+# - Confidence computed per unit+ctx from:
+#   * count of successful learning updates in that ctx
+#   * trace(P) (uncertainty proxy)
+# - Applied by blending dem_opt toward prev_eff:
+#     dem_blend = prev_eff + conf*(dem_opt - prev_eff)
+#
+# If confidence is very low -> essentially frozen at prev_eff.
+CONF_COUNT_SCALE = 10.0     # larger -> slower confidence growth from counts
+CONF_P_NORM_SCALE = 1.0     # P trace normalized by (4*P0); scale for influence
+CONF_FREEZE_THRESHOLD = 0.15  # below this, treat as "frozen" (blend=0)
+CONF_MAX = 1.0
 
 
 # ============================================================
@@ -394,10 +416,7 @@ def _set_quiet(quiet_switch, turn_on, unit_name):
     except Exception as e:
         log.error("Daikin ML (%s): failed to set QUIET_SWITCH %s: %s", unit_name, quiet_switch, e)
 
-# ============================================================
-# CHANGE (ONLY): add direction parameter so we can force snapping DOWN when cap-limited
-# This prevents selecting an option above icing cap (which caused bouncing).
-# ============================================================
+# NOTE (existing change): direction parameter added so we can force snapping DOWN when cap-limited.
 def _apply_demand(unit_name, select_entity, target_percent, prev_str, direction=0):
     option = _snap_to_select(select_entity, float(target_percent), direction)
     if option and option != prev_str:
@@ -470,6 +489,30 @@ def _read_temp_guard(unit):
 
     return float(min_v), float(max_v), str(min_ent), str(max_ent)
 
+# NEW FEATURE: confidence helpers
+def _p_trace(P):
+    try:
+        t = float(P[0][0]) + float(P[1][1]) + float(P[2][2]) + float(P[3][3])
+        return t if isfinite(t) else float(4.0 * P0)
+    except Exception:
+        return float(4.0 * P0)
+
+def _confidence_from(count, P):
+    # count factor: grows from 0 -> 1 as count increases
+    c_count = float(count) / float(count + CONF_COUNT_SCALE) if count >= 0 else 0.0
+
+    # P factor: initial trace ~= 4*P0 => norm_trace ~= 1.0; better confidence when trace smaller
+    tr = _p_trace(P)
+    norm_trace = tr / float(4.0 * P0) if P0 > 0 else 1.0
+    if not isfinite(norm_trace):
+        norm_trace = 1.0
+    norm_trace = _clip(norm_trace, 0.0, 10.0)
+
+    c_p = 1.0 / (1.0 + CONF_P_NORM_SCALE * norm_trace)  # initial ~ 0.5, improves as P shrinks
+
+    conf = _clip(c_count * (2.0 * c_p), 0.0, CONF_MAX)  # scale so mature ctx can approach 1.0
+    return float(conf), float(tr), float(norm_trace), float(c_count), float(c_p)
+
 
 # ============================================================
 # 4) STATE (per unit)
@@ -481,6 +524,9 @@ _params_loaded     = {}
 _last_defrosting   = {}
 _cooldown_until    = {}
 _last_resort_since = {}
+
+# NEW FEATURE: count of successful learning updates per unit+ctx (not persisted)
+_updates_by_unit_ctx = {}
 
 def _persist_all_stores():
     for u in DAIKINS:
@@ -502,6 +548,8 @@ def _init_unit_if_needed(unit_name):
         _cooldown_until[unit_name] = 0.0
     if unit_name not in _last_resort_since:
         _last_resort_since[unit_name] = 0.0
+    if unit_name not in _updates_by_unit_ctx:
+        _updates_by_unit_ctx[unit_name] = {}
 
 def _load_params_from_store(unit):
     unit_name = unit["name"]
@@ -549,6 +597,7 @@ def _init_context_params_if_needed(unit):
 
     _theta_by_unit_ctx[unit_name] = {}
     _P_by_unit_ctx[unit_name] = {}
+    _updates_by_unit_ctx[unit_name] = {}
 
     _load_params_from_store(unit)
 
@@ -557,6 +606,8 @@ def _init_context_params_if_needed(unit):
                                                [0, P0, 0, 0],
                                                [0, 0, P0, 0],
                                                [0, 0, 0, P0]]
+        _updates_by_unit_ctx[unit_name][str(key)] = 0
+
     _params_loaded[unit_name] = True
 
 
@@ -667,9 +718,7 @@ def _run_one_unit(u):
     if _last_defrosting[unit_name] is None:
         _last_defrosting[unit_name] = defrosting
 
-    # ============================================================
-    # CHANGE (kept from earlier request): cooldown starts at BEGINNING of defrost
-    # ============================================================
+    # CHANGE (kept): cooldown starts at BEGINNING of defrost
     if (_last_defrosting[unit_name] is False) and (defrosting is True):
         _cooldown_until[unit_name] = now + COOLDOWN_MINUTES * 60.0
 
@@ -692,6 +741,8 @@ def _run_one_unit(u):
                                           [0, P0, 0, 0],
                                           [0, 0, P0, 0],
                                           [0, 0, 0, P0]]
+    if ctx not in _updates_by_unit_ctx[unit_name]:
+        _updates_by_unit_ctx[unit_name][ctx] = 0
 
     theta = _theta_by_unit_ctx[unit_name][ctx]
     P     = _P_by_unit_ctx[unit_name][ctx]
@@ -704,7 +755,15 @@ def _run_one_unit(u):
              [0, 0, 0, P0]]
         _theta_by_unit_ctx[unit_name][ctx] = theta
         _P_by_unit_ctx[unit_name][ctx] = P
+        _updates_by_unit_ctx[unit_name][ctx] = 0
         _save_params_to_store(u)
+
+    # NEW FEATURE: compute confidence before using dem_opt
+    upd_count = int(_updates_by_unit_ctx[unit_name].get(ctx, 0) or 0)
+    confidence, P_tr, P_norm, c_count, c_p = _confidence_from(upd_count, P)
+    blend_factor = confidence
+    if blend_factor < CONF_FREEZE_THRESHOLD:
+        blend_factor = 0.0
 
     step_limit, deadband = _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_current)
 
@@ -759,6 +818,10 @@ def _run_one_unit(u):
             P = P_new
             _theta_by_unit_ctx[unit_name][ctx] = theta
             _P_by_unit_ctx[unit_name][ctx] = P
+
+            # NEW FEATURE: increment update count on successful update
+            _updates_by_unit_ctx[unit_name][ctx] = int(_updates_by_unit_ctx[unit_name].get(ctx, 0) or 0) + 1
+
             _save_params_to_store(u)
         else:
             _theta_by_unit_ctx[unit_name][ctx] = theta_prev
@@ -766,6 +829,13 @@ def _run_one_unit(u):
     else:
         _theta_by_unit_ctx[unit_name][ctx] = theta
         _P_by_unit_ctx[unit_name][ctx] = P
+
+    # Recompute confidence after potential update (so it improves immediately after learning)
+    upd_count = int(_updates_by_unit_ctx[unit_name].get(ctx, 0) or 0)
+    confidence, P_tr, P_norm, c_count, c_p = _confidence_from(upd_count, P)
+    blend_factor = confidence
+    if blend_factor < CONF_FREEZE_THRESHOLD:
+        blend_factor = 0.0
 
     # --- compute dem_opt ---
     Tout_future = _avg_future_outdoor(WEATHER, OUTDOOR)
@@ -826,19 +896,24 @@ def _run_one_unit(u):
             temp_guard_max=max_temp,
             temp_guard_min_helper=min_ent,
             temp_guard_max_helper=max_ent,
+
+            # NEW FEATURE: expose confidence info
+            confidence=round(float(confidence), 4),
+            confidence_blend=round(float(blend_factor), 4),
+            ctx_updates=int(upd_count),
+            p_trace=round(float(P_tr), 2),
+            p_norm=round(float(P_norm), 4),
+            conf_count_factor=round(float(c_count), 4),
+            conf_p_factor=round(float(c_p), 4),
+
             note=note,
         )
     except Exception as e:
         log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
 
     # ============================================================
-    # NEW: HARD TEMPERATURE GUARD OVERRIDE ("no matter what")
+    # HARD TEMPERATURE GUARD OVERRIDE ("no matter what")
     # ============================================================
-    # If Tin below min_temp -> force MAX demand allowed by system (100 or band_upper, whichever smaller)
-    # If Tin above max_temp -> force MIN demand (MIN_DEM)
-    #
-    # This override ignores ML target, price bias, monotonic constraint, and step limits.
-    #
     temp_override = None
     if isfinite(min_temp) and Tin < min_temp:
         temp_override = "below_min"
@@ -851,8 +926,11 @@ def _run_one_unit(u):
         if abs(err) <= deadband:
             dem_target = prev_eff
         else:
-            dem_target = dem_opt
+            # NEW FEATURE: confidence-based blending ("auto-freeze" when low confidence)
+            dem_blend = prev_eff + float(blend_factor) * (float(dem_opt) - float(prev_eff))
+            dem_target = dem_blend
 
+        # Keep existing monotonic constraint
         if err > deadband and dem_target < prev_eff:
             dem_target = prev_eff
 
@@ -892,10 +970,7 @@ def _run_one_unit(u):
         # If no quiet available or temp_override active, don't use last-resort timer
         _last_resort_since[unit_name] = 0.0
 
-    # ============================================================
-    # CHANGE (ONLY): if we are at/near cap, snap DOWN so we never select above band_upper
-    # This prevents "cap reached -> jump over cap -> cap guard forces back down" bouncing.
-    # ============================================================
+    # CHANGE (kept): if we are at/near cap, snap DOWN so we never select above band_upper
     cap_limited = (dem_clip >= (float(band_upper) - 1e-9))
     snap_dir = -1 if cap_limited else 0
 
@@ -906,9 +981,10 @@ def _run_one_unit(u):
         option = _apply_demand(unit_name, SELECT, dem_clip, prev_str, direction=snap_dir)
 
     log.info(
-        "Daikin ML (%s): ctx=%s Tin=%.2f Tout=%.2f sp=%.2f err=%.2f | temp_guard=[%.2f..%.2f] override=%s | "
-        "band_upper=%.0f quiet_avail=%s | dem_opt=%.1f price_bias=%.2f -> dem_clip=%.1f -> %s",
+        "Daikin ML (%s): ctx=%s Tin=%.2f Tout=%.2f sp=%.2f err=%.2f | conf=%.3f blend=%.3f upd=%s P_tr=%.1f | "
+        "temp_guard=[%.2f..%.2f] override=%s | band_upper=%.0f quiet_avail=%s | dem_opt=%.1f price_bias=%.2f -> dem_clip=%.1f -> %s",
         unit_name, ctx, Tin, Tout_raw, sp, err,
+        float(confidence), float(blend_factor), str(upd_count), float(P_tr),
         min_temp, max_temp, str(temp_override),
         band_upper, str(quiet_available),
         float(dem_opt), float(price_bias),
@@ -927,7 +1003,7 @@ def daikin_ml_step():
 @service
 def daikin_ml_reset():
     """Reset learning for all units."""
-    global _theta_by_unit_ctx, _P_by_unit_ctx, _params_loaded, _last_defrosting, _cooldown_until, _last_resort_since
+    global _theta_by_unit_ctx, _P_by_unit_ctx, _params_loaded, _last_defrosting, _cooldown_until, _last_resort_since, _updates_by_unit_ctx
 
     for u in DAIKINS:
         unit_name = u["name"]
@@ -939,6 +1015,7 @@ def daikin_ml_reset():
         _last_defrosting[unit_name] = None
         _cooldown_until[unit_name] = 0.0
         _last_resort_since[unit_name] = 0.0
+        _updates_by_unit_ctx[unit_name] = {}
 
         try:
             state.set(u["STORE_ENTITY"], value=time.time(), theta_by_ctx={})
