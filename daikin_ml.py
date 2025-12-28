@@ -23,6 +23,19 @@
 #
 # NEW FEATURE ADDED NOW:
 # - Confidence scoring & auto-freeze (blend ML output based on confidence per ctx)
+#
+# CHANGE:
+# - Nord Pool price bias now changes SETPOINT LITERALLY:
+#     * base setpoint is read from SP_BASE_HELPER (optional)
+#     * effective setpoint is written to SP_HELPER every run
+#   So you can log/see the Nord Pool effect as real setpoint movement in HA.
+#
+# CHANGE:
+# - Persist confidence map (ctx update counts) across restarts:
+#     * store attribute: updates_by_ctx in STORE_ENTITY
+#     * load it on startup
+#     * do NOT overwrite loaded counts during init
+#     * reset clears it too
 
 import time
 from math import isfinite
@@ -47,7 +60,14 @@ DAIKINS = [
         "SELECT": "select.faikin_demand_control",
         "LIQUID": "sensor.faikin_liquid",
 
+        # Effective setpoint helper (this will be UPDATED by Nord Pool bias)
         "SP_HELPER": "input_number.daikin_setpoint",
+
+        # Optional base setpoint helper (recommended to create):
+        # When present, Nord Pool bias applies around this base value.
+        # If missing, SP_HELPER is used as base.
+        "SP_BASE_HELPER": "input_number.daikin_setpoint_base",
+
         "STEP_LIMIT_HELPER": "input_number.daikin_step_limit",
         "DEADBAND_HELPER": "input_number.daikin_deadband",
         "ICING_CAP_HELPER": "input_number.daikin_icing_cap",
@@ -79,6 +99,7 @@ DAIKINS = [
     #     "SELECT": "select.toinen_daikin_demand_control",
     #     "LIQUID": "sensor.toinen_daikin_liquid",
     #     "SP_HELPER": "input_number.daikin2_setpoint",
+    #     "SP_BASE_HELPER": "input_number.daikin2_setpoint_base",
     #     "STEP_LIMIT_HELPER": "input_number.daikin2_step_limit",
     #     "DEADBAND_HELPER": "input_number.daikin2_deadband",
     #     "ICING_CAP_HELPER": "input_number.daikin2_icing_cap",
@@ -131,18 +152,20 @@ TEMP_GUARD_MAX_DEFAULT =  100.0
 # ============================================================
 # NEW FEATURE: Confidence scoring & auto-freeze (blend)
 # ============================================================
-# - Confidence computed per unit+ctx from:
-#   * count of successful learning updates in that ctx
-#   * trace(P) (uncertainty proxy)
-# - Applied by blending dem_opt toward prev_eff:
-#     dem_blend = prev_eff + conf*(dem_opt - prev_eff)
-#
-# If confidence is very low -> essentially frozen at prev_eff.
-CONF_COUNT_SCALE = 10.0     # larger -> slower confidence growth from counts
-CONF_P_NORM_SCALE = 1.0     # P trace normalized by (4*P0); scale for influence
-CONF_FREEZE_THRESHOLD = 0.15  # below this, treat as "frozen" (blend=0)
+CONF_COUNT_SCALE = 10.0
+CONF_P_NORM_SCALE = 1.0
+CONF_FREEZE_THRESHOLD = 0.15
 CONF_MAX = 1.0
 
+# ============================================================
+# CHANGE NOW: Price bias -> setpoint delta mapping
+# ============================================================
+# nordpool_15m_bias.py writes bias points in range [-20..+20] by default.
+# We map that to a setpoint delta in Celsius, so bias becomes a REAL setpoint change in HA.
+PRICE_BIAS_POINTS_AT_MAX = 20.0
+PRICE_BIAS_MAX_SETPOINT_DELTA_C = 0.5   # max +/- °C applied to base setpoint
+PRICE_BIAS_SETPOINT_MIN_C = 5.0
+PRICE_BIAS_SETPOINT_MAX_C = 30.0
 
 # ============================================================
 # 3) HELPERS
@@ -416,6 +439,14 @@ def _set_quiet(quiet_switch, turn_on, unit_name):
     except Exception as e:
         log.error("Daikin ML (%s): failed to set QUIET_SWITCH %s: %s", unit_name, quiet_switch, e)
 
+def _set_input_number_value(entity_id, value):
+    if not entity_id:
+        return
+    try:
+        input_number.set_value(entity_id=entity_id, value=float(value))
+    except Exception as e:
+        log.debug("Daikin ML: could not set %s. err=%s", entity_id, e)
+
 # NOTE (existing change): direction parameter added so we can force snapping DOWN when cap-limited.
 def _apply_demand(unit_name, select_entity, target_percent, prev_str, direction=0):
     option = _snap_to_select(select_entity, float(target_percent), direction)
@@ -457,6 +488,18 @@ def _read_price_bias_points(unit):
     except Exception:
         return 0.0
 
+def _price_bias_to_setpoint_delta_c(points):
+    try:
+        p = float(points)
+    except Exception:
+        return 0.0
+    if not isfinite(p):
+        return 0.0
+    if PRICE_BIAS_POINTS_AT_MAX <= 0:
+        return 0.0
+    frac = _clip(p / float(PRICE_BIAS_POINTS_AT_MAX), -1.0, 1.0)
+    return float(frac) * float(PRICE_BIAS_MAX_SETPOINT_DELTA_C)
+
 def _read_temp_guard(unit):
     """Return (min_temp, max_temp, min_ent, max_ent) using defaults if missing."""
     min_ent = unit.get("MIN_TEMP_HELPER")
@@ -481,7 +524,6 @@ def _read_temp_guard(unit):
         except Exception:
             pass
 
-    # sanity: if user sets inverted, swap
     if min_v > max_v:
         tmp = min_v
         min_v = max_v
@@ -489,7 +531,6 @@ def _read_temp_guard(unit):
 
     return float(min_v), float(max_v), str(min_ent), str(max_ent)
 
-# NEW FEATURE: confidence helpers
 def _p_trace(P):
     try:
         t = float(P[0][0]) + float(P[1][1]) + float(P[2][2]) + float(P[3][3])
@@ -498,19 +539,17 @@ def _p_trace(P):
         return float(4.0 * P0)
 
 def _confidence_from(count, P):
-    # count factor: grows from 0 -> 1 as count increases
     c_count = float(count) / float(count + CONF_COUNT_SCALE) if count >= 0 else 0.0
 
-    # P factor: initial trace ~= 4*P0 => norm_trace ~= 1.0; better confidence when trace smaller
     tr = _p_trace(P)
     norm_trace = tr / float(4.0 * P0) if P0 > 0 else 1.0
     if not isfinite(norm_trace):
         norm_trace = 1.0
     norm_trace = _clip(norm_trace, 0.0, 10.0)
 
-    c_p = 1.0 / (1.0 + CONF_P_NORM_SCALE * norm_trace)  # initial ~ 0.5, improves as P shrinks
+    c_p = 1.0 / (1.0 + CONF_P_NORM_SCALE * norm_trace)
 
-    conf = _clip(c_count * (2.0 * c_p), 0.0, CONF_MAX)  # scale so mature ctx can approach 1.0
+    conf = _clip(c_count * (2.0 * c_p), 0.0, CONF_MAX)
     return float(conf), float(tr), float(norm_trace), float(c_count), float(c_p)
 
 
@@ -525,7 +564,6 @@ _last_defrosting   = {}
 _cooldown_until    = {}
 _last_resort_since = {}
 
-# NEW FEATURE: count of successful learning updates per unit+ctx (not persisted)
 _updates_by_unit_ctx = {}
 
 def _persist_all_stores():
@@ -555,6 +593,8 @@ def _load_params_from_store(unit):
     unit_name = unit["name"]
     store = unit["STORE_ENTITY"]
     attrs = state.getattr(store) or {}
+
+    # --- load theta_by_ctx (existing) ---
     tb = attrs.get("theta_by_ctx")
     new = {}
     if isinstance(tb, dict):
@@ -569,9 +609,25 @@ def _load_params_from_store(unit):
     if new:
         _theta_by_unit_ctx[unit_name] = new
 
+    # --- NEW: load updates_by_ctx (persisted confidence map) ---
+    ub = attrs.get("updates_by_ctx")
+    upd_new = {}
+    if isinstance(ub, dict):
+        for key, val in ub.items():
+            try:
+                iv = int(val)
+                if iv < 0:
+                    iv = 0
+                upd_new[str(key)] = iv
+            except Exception:
+                continue
+    if upd_new:
+        _updates_by_unit_ctx[unit_name] = upd_new
+
 def _save_params_to_store(unit):
     unit_name = unit["name"]
     store = unit["STORE_ENTITY"]
+
     clean = {}
     for key, th in (_theta_by_unit_ctx.get(unit_name) or {}).items():
         if not isinstance(th, (list, tuple)) or len(th) != 4:
@@ -584,8 +640,20 @@ def _save_params_to_store(unit):
             round(float(th[2]), 4),
             round(float(th[3]), 4),
         ]
+
+    # NEW: persist ctx update counts too
+    upd_clean = {}
+    for key, v in (_updates_by_unit_ctx.get(unit_name) or {}).items():
+        try:
+            iv = int(v)
+            if iv < 0:
+                iv = 0
+            upd_clean[str(key)] = iv
+        except Exception:
+            continue
+
     try:
-        state.set(store, value=time.time(), theta_by_ctx=clean)
+        state.set(store, value=time.time(), theta_by_ctx=clean, updates_by_ctx=upd_clean)
     except Exception as e:
         log.error("Daikin ML (%s): error saving thetas to %s: %s", unit_name, store, e)
 
@@ -602,11 +670,14 @@ def _init_context_params_if_needed(unit):
     _load_params_from_store(unit)
 
     for key in (_theta_by_unit_ctx.get(unit_name) or {}).keys():
-        _P_by_unit_ctx[unit_name][str(key)] = [[P0, 0, 0, 0],
-                                               [0, P0, 0, 0],
-                                               [0, 0, P0, 0],
-                                               [0, 0, 0, P0]]
-        _updates_by_unit_ctx[unit_name][str(key)] = 0
+        k = str(key)
+        _P_by_unit_ctx[unit_name][k] = [[P0, 0, 0, 0],
+                                        [0, P0, 0, 0],
+                                        [0, 0, P0, 0],
+                                        [0, 0, 0, P0]]
+        # NEW: keep loaded update counts; only default to 0 if missing
+        if k not in (_updates_by_unit_ctx.get(unit_name) or {}):
+            _updates_by_unit_ctx[unit_name][k] = 0
 
     _params_loaded[unit_name] = True
 
@@ -668,6 +739,8 @@ def _run_one_unit(u):
     PRICE_BIAS_HELPER = u.get("PRICE_BIAS_HELPER")
 
     SP_HELPER = u["SP_HELPER"]
+    SP_BASE_HELPER = u.get("SP_BASE_HELPER")
+
     STEP_LIMIT_HELPER = u["STEP_LIMIT_HELPER"]
     DEADBAND_HELPER = u["DEADBAND_HELPER"]
     ICING_CAP_HELPER = u["ICING_CAP_HELPER"]
@@ -694,7 +767,38 @@ def _run_one_unit(u):
     else:
         rate_bad = False
 
-    sp = float(state.get(SP_HELPER) or 22.5)
+    # --- Nord Pool bias points ---
+    price_bias = _read_price_bias_points(u)
+
+    # --- Base setpoint (new) + effective setpoint written to SP_HELPER (literal) ---
+    base_sp = None
+    if SP_BASE_HELPER:
+        try:
+            v = state.get(SP_BASE_HELPER)
+            if v is not None:
+                fv = float(v)
+                if isfinite(fv):
+                    base_sp = fv
+        except Exception:
+            base_sp = None
+
+    if base_sp is None:
+        try:
+            base_sp = float(state.get(SP_HELPER) or 22.5)
+        except Exception:
+            base_sp = 22.5
+        if not isfinite(base_sp):
+            base_sp = 22.5
+
+    sp_delta = _price_bias_to_setpoint_delta_c(price_bias)
+    sp_effective = _clip(base_sp + sp_delta, PRICE_BIAS_SETPOINT_MIN_C, PRICE_BIAS_SETPOINT_MAX_C)
+
+    # Write effective setpoint so it is visible in HA logs/history (literal change)
+    _set_input_number_value(SP_HELPER, round(float(sp_effective), 2))
+
+    # Use effective setpoint for control
+    sp = float(sp_effective)
+
     step_limit_current = float(state.get(STEP_LIMIT_HELPER) or 10.0)
     deadband_current   = float(state.get(DEADBAND_HELPER) or 0.1)
 
@@ -718,7 +822,6 @@ def _run_one_unit(u):
     if _last_defrosting[unit_name] is None:
         _last_defrosting[unit_name] = defrosting
 
-    # CHANGE (kept): cooldown starts at BEGINNING of defrost
     if (_last_defrosting[unit_name] is False) and (defrosting is True):
         _cooldown_until[unit_name] = now + COOLDOWN_MINUTES * 60.0
 
@@ -728,7 +831,6 @@ def _run_one_unit(u):
     if not (isfinite(Tin) and isfinite(Tout_raw)):
         return
 
-    # NEW: Read temperature guardrails
     min_temp, max_temp, min_ent, max_ent = _read_temp_guard(u)
 
     Tout_bucket = int(round(Tout_raw))
@@ -758,7 +860,6 @@ def _run_one_unit(u):
         _updates_by_unit_ctx[unit_name][ctx] = 0
         _save_params_to_store(u)
 
-    # NEW FEATURE: compute confidence before using dem_opt
     upd_count = int(_updates_by_unit_ctx[unit_name].get(ctx, 0) or 0)
     confidence, P_tr, P_norm, c_count, c_p = _confidence_from(upd_count, P)
     blend_factor = confidence
@@ -767,7 +868,6 @@ def _run_one_unit(u):
 
     step_limit, deadband = _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_current)
 
-    # Caps
     if Tout_bucket <= -5:
         global_upper = MAX_DEM
     else:
@@ -784,7 +884,6 @@ def _run_one_unit(u):
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
     band_upper = min(global_upper, icing_cap) if in_icing_band else global_upper
 
-    # If previous is > cap, clamp and quiet OFF
     if prev > band_upper:
         if quiet_available:
             _set_quiet(QUIET_SWITCH, False, unit_name)
@@ -796,7 +895,6 @@ def _run_one_unit(u):
 
     prev_eff = prev if prev <= band_upper else band_upper
 
-    # --- ML learning update (optional) ---
     err         = sp - Tin
     demand_norm = _clip(prev_eff / 100.0, 0.0, 1.0)
     x = [1.0, err, demand_norm, (Tout_raw - Tin)]
@@ -818,10 +916,7 @@ def _run_one_unit(u):
             P = P_new
             _theta_by_unit_ctx[unit_name][ctx] = theta
             _P_by_unit_ctx[unit_name][ctx] = P
-
-            # NEW FEATURE: increment update count on successful update
             _updates_by_unit_ctx[unit_name][ctx] = int(_updates_by_unit_ctx[unit_name].get(ctx, 0) or 0) + 1
-
             _save_params_to_store(u)
         else:
             _theta_by_unit_ctx[unit_name][ctx] = theta_prev
@@ -830,14 +925,12 @@ def _run_one_unit(u):
         _theta_by_unit_ctx[unit_name][ctx] = theta
         _P_by_unit_ctx[unit_name][ctx] = P
 
-    # Recompute confidence after potential update (so it improves immediately after learning)
     upd_count = int(_updates_by_unit_ctx[unit_name].get(ctx, 0) or 0)
     confidence, P_tr, P_norm, c_count, c_p = _confidence_from(upd_count, P)
     blend_factor = confidence
     if blend_factor < CONF_FREEZE_THRESHOLD:
         blend_factor = 0.0
 
-    # --- compute dem_opt ---
     Tout_future = _avg_future_outdoor(WEATHER, OUTDOOR)
     Tout_eff    = 0.5 * Tout_raw + 0.5 * Tout_future
     dTin_target = _clip(KAPPA * err / HORIZON_H, -2.0, 2.0)
@@ -856,8 +949,6 @@ def _run_one_unit(u):
     dem_opt = _clip((num / (denom_mag * denom_sign)) * 100.0, 0.0, 100.0)
     if not isfinite(dem_opt):
         dem_opt = prev_eff
-
-    price_bias = _read_price_bias_points(u)
 
     # --- learned sensor update (attrs always updated) ---
     try:
@@ -882,22 +973,29 @@ def _run_one_unit(u):
             ctx=ctx,
             outdoor_bucket=Tout_bucket,
             outdoor=round(Tout_raw, 1),
+
+            # Setpoint now reflects literal (biased) SP_HELPER value
             setpoint=round(sp, 2),
+            setpoint_base=round(float(base_sp), 2),
+            setpoint_bias_delta=round(float(sp_delta), 3),
+
             indoor=round(Tin, 2),
             defrosting=defrosting,
             cooldown=in_cooldown,
             rate=round(rate, 4),
             learning_enabled=bool(learning_enabled),
             learning_allowed=bool(allow_learning),
+
             price_bias_points=round(float(price_bias), 2),
             price_bias_helper=str(PRICE_BIAS_HELPER),
+
             quiet_available=bool(quiet_available),
+
             temp_guard_min=min_temp,
             temp_guard_max=max_temp,
             temp_guard_min_helper=min_ent,
             temp_guard_max_helper=max_ent,
 
-            # NEW FEATURE: expose confidence info
             confidence=round(float(confidence), 4),
             confidence_blend=round(float(blend_factor), 4),
             ctx_updates=int(upd_count),
@@ -922,20 +1020,17 @@ def _run_one_unit(u):
         temp_override = "above_max"
         dem_clip = float(MIN_DEM)
     else:
-        # Normal control path
         if abs(err) <= deadband:
             dem_target = prev_eff
         else:
-            # NEW FEATURE: confidence-based blending ("auto-freeze" when low confidence)
             dem_blend = prev_eff + float(blend_factor) * (float(dem_opt) - float(prev_eff))
             dem_target = dem_blend
 
-        # Keep existing monotonic constraint
         if err > deadband and dem_target < prev_eff:
             dem_target = prev_eff
 
-        if abs(price_bias) > 0.0001:
-            dem_target = dem_target + price_bias
+        # IMPORTANT CHANGE: price bias is now expressed via setpoint, not added to demand here.
+        # (No dem_target += price_bias)
 
         delta = dem_target - prev_eff
         if delta > 0:
@@ -949,8 +1044,6 @@ def _run_one_unit(u):
 
         dem_clip = _clip(dem_target, MIN_DEM, min(band_upper, 100.0))
 
-    # REAL 100 last-resort gating only if quiet is available (and only in normal control path;
-    # with temp_override below_min, we allow real 100 if needed because it's "no matter what")
     allow_real_100 = True
     want_full = (dem_clip >= 99.95) and (band_upper >= 100.0)
 
@@ -967,23 +1060,20 @@ def _run_one_unit(u):
         else:
             _last_resort_since[unit_name] = 0.0
     else:
-        # If no quiet available or temp_override active, don't use last-resort timer
         _last_resort_since[unit_name] = 0.0
 
-    # CHANGE (kept): if we are at/near cap, snap DOWN so we never select above band_upper
     cap_limited = (dem_clip >= (float(band_upper) - 1e-9))
     snap_dir = -1 if cap_limited else 0
 
-    # Apply final command
     if quiet_available:
         option = _apply_demand_with_quiet(unit_name, SELECT, QUIET_SWITCH, dem_clip, prev_str, allow_real_100, direction=snap_dir)
     else:
         option = _apply_demand(unit_name, SELECT, dem_clip, prev_str, direction=snap_dir)
 
     log.info(
-        "Daikin ML (%s): ctx=%s Tin=%.2f Tout=%.2f sp=%.2f err=%.2f | conf=%.3f blend=%.3f upd=%s P_tr=%.1f | "
-        "temp_guard=[%.2f..%.2f] override=%s | band_upper=%.0f quiet_avail=%s | dem_opt=%.1f price_bias=%.2f -> dem_clip=%.1f -> %s",
-        unit_name, ctx, Tin, Tout_raw, sp, err,
+        "Daikin ML (%s): ctx=%s Tin=%.2f Tout=%.2f sp_eff=%.2f sp_base=%.2f sp_d=%.3f err=%.2f | conf=%.3f blend=%.3f upd=%s P_tr=%.1f | "
+        "temp_guard=[%.2f..%.2f] override=%s | band_upper=%.0f quiet_avail=%s | dem_opt=%.1f price_bias_pts=%.2f -> dem_clip=%.1f -> %s",
+        unit_name, ctx, Tin, Tout_raw, float(sp), float(base_sp), float(sp_delta), err,
         float(confidence), float(blend_factor), str(upd_count), float(P_tr),
         min_temp, max_temp, str(temp_override),
         band_upper, str(quiet_available),
@@ -1018,7 +1108,7 @@ def daikin_ml_reset():
         _updates_by_unit_ctx[unit_name] = {}
 
         try:
-            state.set(u["STORE_ENTITY"], value=time.time(), theta_by_ctx={})
+            state.set(u["STORE_ENTITY"], value=time.time(), theta_by_ctx={}, updates_by_ctx={})
         except Exception as e:
             log.error("Daikin ML RESET (%s): error resetting params in %s: %s", unit_name, u["STORE_ENTITY"], e)
 
