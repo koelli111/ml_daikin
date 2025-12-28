@@ -394,28 +394,32 @@ def _set_quiet(quiet_switch, turn_on, unit_name):
     except Exception as e:
         log.error("Daikin ML (%s): failed to set QUIET_SWITCH %s: %s", unit_name, quiet_switch, e)
 
-def _apply_demand(unit_name, select_entity, target_percent, prev_str):
-    option = _snap_to_select(select_entity, float(target_percent), 0)
+# ============================================================
+# CHANGE (ONLY): add direction parameter so we can force snapping DOWN when cap-limited
+# This prevents selecting an option above icing cap (which caused bouncing).
+# ============================================================
+def _apply_demand(unit_name, select_entity, target_percent, prev_str, direction=0):
+    option = _snap_to_select(select_entity, float(target_percent), direction)
     if option and option != prev_str:
         select.select_option(entity_id=select_entity, option=option)
     return option
 
-def _apply_demand_with_quiet(unit_name, select_entity, quiet_switch, target_percent, prev_str, allow_real_100):
+def _apply_demand_with_quiet(unit_name, select_entity, quiet_switch, target_percent, prev_str, allow_real_100, direction=0):
     t = float(target_percent)
 
     if t >= 100.0:
         if allow_real_100:
             _set_quiet(quiet_switch, False, unit_name)
-            option = _snap_to_select(select_entity, 100.0, 0)
+            option = _snap_to_select(select_entity, 100.0, direction)
         else:
             _set_quiet(quiet_switch, True, unit_name)
-            option = _snap_to_select(select_entity, 100.0, 0)
+            option = _snap_to_select(select_entity, 100.0, direction)
     elif t > GLOBAL_MILD_MAX:
         _set_quiet(quiet_switch, True, unit_name)
-        option = _snap_to_select(select_entity, 100.0, 0)
+        option = _snap_to_select(select_entity, 100.0, direction)
     else:
         _set_quiet(quiet_switch, False, unit_name)
-        option = _snap_to_select(select_entity, t, 0)
+        option = _snap_to_select(select_entity, t, direction)
 
     if option and option != prev_str:
         select.select_option(entity_id=select_entity, option=option)
@@ -664,10 +668,7 @@ def _run_one_unit(u):
         _last_defrosting[unit_name] = defrosting
 
     # ============================================================
-    # CHANGE (ONLY): cooldown starts at BEGINNING of defrost
-    # Old:
-    # if (_last_defrosting[unit_name] is True) and (defrosting is False):
-    #     _cooldown_until[unit_name] = now + COOLDOWN_MINUTES * 60.0
+    # CHANGE (kept from earlier request): cooldown starts at BEGINNING of defrost
     # ============================================================
     if (_last_defrosting[unit_name] is False) and (defrosting is True):
         _cooldown_until[unit_name] = now + COOLDOWN_MINUTES * 60.0
@@ -891,11 +892,18 @@ def _run_one_unit(u):
         # If no quiet available or temp_override active, don't use last-resort timer
         _last_resort_since[unit_name] = 0.0
 
+    # ============================================================
+    # CHANGE (ONLY): if we are at/near cap, snap DOWN so we never select above band_upper
+    # This prevents "cap reached -> jump over cap -> cap guard forces back down" bouncing.
+    # ============================================================
+    cap_limited = (dem_clip >= (float(band_upper) - 1e-9))
+    snap_dir = -1 if cap_limited else 0
+
     # Apply final command
     if quiet_available:
-        option = _apply_demand_with_quiet(unit_name, SELECT, QUIET_SWITCH, dem_clip, prev_str, allow_real_100)
+        option = _apply_demand_with_quiet(unit_name, SELECT, QUIET_SWITCH, dem_clip, prev_str, allow_real_100, direction=snap_dir)
     else:
-        option = _apply_demand(unit_name, SELECT, dem_clip, prev_str)
+        option = _apply_demand(unit_name, SELECT, dem_clip, prev_str, direction=snap_dir)
 
     log.info(
         "Daikin ML (%s): ctx=%s Tin=%.2f Tout=%.2f sp=%.2f err=%.2f | temp_guard=[%.2f..%.2f] override=%s | "
