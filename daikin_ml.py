@@ -1,41 +1,22 @@
 # pyscript/daikin_ml_multi.py
 # Online-RLS Daikin demand controller with MULTI-DAIKIN support.
 #
-# Included:
-# - Multi-daikin support (DAIKINS list)
-# - NaN/inf guards
-# - Learning enable switch (global + per-unit override)
-# - OPTION A (improved learned sensor): value frozen when learning disabled, attrs always updated
-# - Nord Pool 15-min price bias integration (per-unit input_number bias points)
-# - Quiet Outdoor support IF available; if QUIET_SWITCH missing/not existing -> skip quiet logic and use normal 95->100
-# - REAL 100% "last resort" gating ONLY when quiet is available (because QUIET 100 intermediate exists)
-#
-# NEW:
-# - Hard indoor temperature guardrails via helpers:
-#     * MIN_TEMP_HELPER: below this -> heat "no matter what" (force demand up)
-#     * MAX_TEMP_HELPER: above this -> stop heating "no matter what" (force demand down)
-# - These overrides bypass Nordpool bias + ML target selection logic.
-# - Temperature override is evaluated every tick and applied immediately.
-#
-# CHANGES already applied previously:
+# CHANGES:
 # - Cooldown starts at the beginning of the defrost.
 # - Prevent jumping above icing cap (snap DOWN when cap-limited).
-#
-# NEW FEATURE ADDED NOW:
 # - Confidence scoring & auto-freeze (blend ML output based on confidence per ctx)
+# - Nord Pool price bias changes SETPOINT literally (SP_BASE_HELPER + SP_HELPER)
+# - Persist confidence map (updates_by_ctx) across restarts
+# - Humidity-based defrost risk + dynamic icing cap
+# - Forecast temperature+humidity from sensor.weather_forecast_hourly
 #
 # CHANGE:
-# - Nord Pool price bias now changes SETPOINT LITERALLY:
-#     * base setpoint is read from SP_BASE_HELPER (optional)
-#     * effective setpoint is written to SP_HELPER every run
-#   So you can log/see the Nord Pool effect as real setpoint movement in HA.
-#
-# CHANGE:
-# - Persist confidence map (ctx update counts) across restarts:
-#     * store attribute: updates_by_ctx in STORE_ENTITY
-#     * load it on startup
-#     * do NOT overwrite loaded counts during init
-#     * reset clears it too
+# - Add wind factor to ML learning using sensor.weather_forecast_hourly forecast:
+#     * wind_speed taken from first forecast item (fallback: None)
+#     * inject wind into existing 4D feature vector without changing theta dimension
+#       x[3] = (Tout_raw - Tin) + HUMIDITY_FEATURE_K*hum_norm + WIND_FEATURE_K*wind_cold_factor
+#     * wind_cold_factor increases with wind AND colder outdoor temperatures
+#   Everything else remains intact.
 
 import time
 from math import isfinite
@@ -55,17 +36,17 @@ DAIKINS = [
         "INDOOR": "sensor.living_room_lampotila",
         "INDOOR_RATE": "sensor.sisalampotila_aula",
         "OUTDOOR": "sensor.iv_tulo_lampotila",
+
+        # Kept for compatibility (not used for forecast now)
         "WEATHER": "weather.koti",
+
+        # Hourly forecast sensor with forecast list (temperature + humidity + wind_speed)
+        "FORECAST_HOURLY": "sensor.weather_forecast_hourly",
 
         "SELECT": "select.faikin_demand_control",
         "LIQUID": "sensor.faikin_liquid",
 
-        # Effective setpoint helper (this will be UPDATED by Nord Pool bias)
         "SP_HELPER": "input_number.daikin_setpoint",
-
-        # Optional base setpoint helper (recommended to create):
-        # When present, Nord Pool bias applies around this base value.
-        # If missing, SP_HELPER is used as base.
         "SP_BASE_HELPER": "input_number.daikin_setpoint_base",
 
         "STEP_LIMIT_HELPER": "input_number.daikin_step_limit",
@@ -77,39 +58,13 @@ DAIKINS = [
 
         "LEARNING_ENABLED_HELPER": "input_boolean.daikin1_ml_learning_enabled",
 
-        # Optional: quiet switch for "QUIET 100" virtual level (if missing/not existing -> skipped)
         "QUIET_SWITCH": "switch.faikin_quiet_outdoor",
 
-        # Nordpool price bias helper (demand points), set by nordpool_15m_bias.py
         "PRICE_BIAS_HELPER": "input_number.daikin1_price_bias_points",
 
-        # NEW: hard temperature guardrails
-        # If helper missing/unset -> defaults mean "no guard"
         "MIN_TEMP_HELPER": "input_number.daikin1_min_temp_guard",
         "MAX_TEMP_HELPER": "input_number.daikin1_max_temp_guard",
     },
-
-    # Example unit without quiet:
-    # {
-    #     "name": "daikin2",
-    #     "INDOOR": "sensor.toinen_sisalampo",
-    #     "INDOOR_RATE": "sensor.toinen_sisalampo_rate",
-    #     "OUTDOOR": "sensor.toinen_ulkolampo",
-    #     "WEATHER": "weather.koti",
-    #     "SELECT": "select.toinen_daikin_demand_control",
-    #     "LIQUID": "sensor.toinen_daikin_liquid",
-    #     "SP_HELPER": "input_number.daikin2_setpoint",
-    #     "SP_BASE_HELPER": "input_number.daikin2_setpoint_base",
-    #     "STEP_LIMIT_HELPER": "input_number.daikin2_step_limit",
-    #     "DEADBAND_HELPER": "input_number.daikin2_deadband",
-    #     "ICING_CAP_HELPER": "input_number.daikin2_icing_cap",
-    #     "STORE_ENTITY": "pyscript.daikin2_ml_params",
-    #     "LEARNED_SENSOR": "sensor.daikin2_ml_learned_demand",
-    #     "LEARNING_ENABLED_HELPER": "input_boolean.daikin2_ml_learning_enabled",
-    #     "PRICE_BIAS_HELPER": "input_number.daikin2_price_bias_points",
-    #     "MIN_TEMP_HELPER": "input_number.daikin2_min_temp_guard",
-    #     "MAX_TEMP_HELPER": "input_number.daikin2_max_temp_guard",
-    # },
 ]
 
 # ============================================================
@@ -140,17 +95,15 @@ AUTO_DB_MIN    = 0.05
 AUTO_DB_MAX    = 0.50
 AUTO_DB_BASE   = 0.10
 
-# REAL 100% last resort gating (ONLY when quiet switch exists)
 LAST_RESORT_MIN_ERR_C = 0.5
 LAST_RESORT_ERR_C = 1.5
 LAST_RESORT_MINUTES = 30
 
-# NEW: temp guard defaults (meaning "disabled" unless you set helpers)
 TEMP_GUARD_MIN_DEFAULT = -100.0
 TEMP_GUARD_MAX_DEFAULT =  100.0
 
 # ============================================================
-# NEW FEATURE: Confidence scoring & auto-freeze (blend)
+# Confidence scoring & auto-freeze (blend)
 # ============================================================
 CONF_COUNT_SCALE = 10.0
 CONF_P_NORM_SCALE = 1.0
@@ -158,14 +111,39 @@ CONF_FREEZE_THRESHOLD = 0.15
 CONF_MAX = 1.0
 
 # ============================================================
-# CHANGE NOW: Price bias -> setpoint delta mapping
+# Price bias -> setpoint delta mapping
 # ============================================================
-# nordpool_15m_bias.py writes bias points in range [-20..+20] by default.
-# We map that to a setpoint delta in Celsius, so bias becomes a REAL setpoint change in HA.
 PRICE_BIAS_POINTS_AT_MAX = 20.0
-PRICE_BIAS_MAX_SETPOINT_DELTA_C = 0.5   # max +/- °C applied to base setpoint
+PRICE_BIAS_MAX_SETPOINT_DELTA_C = 0.5
 PRICE_BIAS_SETPOINT_MIN_C = 5.0
 PRICE_BIAS_SETPOINT_MAX_C = 30.0
+
+# ============================================================
+# Humidity -> defrost/icing risk + learning feature injection
+# ============================================================
+HUMIDITY_LOW_PCT = 40.0
+HUMIDITY_HIGH_PCT = 90.0
+
+ICING_RISK_CENTER_C = 1.0
+ICING_RISK_HALF_WIDTH_C = 3.0
+
+DYNAMIC_CAP_MAX_REDUCTION_FRAC = 0.25
+DEFROST_RISK_THRESHOLD = 0.60
+
+# Inject humidity into existing feature dimension (keeps theta size=4)
+HUMIDITY_FEATURE_K = 0.05
+
+# ============================================================
+# NEW: Wind factor -> learning feature injection
+# ============================================================
+# wind_speed is read from sensor.weather_forecast_hourly forecast[0].wind_speed (units from HA; typically m/s or km/h).
+# We treat it as a relative factor: higher wind + colder outdoor => more heat loss.
+WIND_SPEED_LOW = 0.0
+WIND_SPEED_HIGH = 20.0   # typical upper bound used for normalization
+WIND_COLD_START_C = 0.0  # above this, wind effect considered minimal
+WIND_COLD_FULL_C = -10.0 # at/colder than this, wind effect is full strength
+WIND_FEATURE_K = 0.07    # scales wind factor contribution into x[3]
+
 
 # ============================================================
 # 3) HELPERS
@@ -341,28 +319,35 @@ def _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_curre
     db_raw = AUTO_DB_BASE * (1.0 + 0.2 * gain)
     db_auto = _clip(db_raw, AUTO_DB_MIN, AUTO_DB_MAX)
 
-    step_auto_rounded = round(step_auto, 1)
-    db_auto_rounded   = round(db_auto, 2)
+    return round(step_auto, 1), round(db_auto, 2)
 
-    return step_auto_rounded, db_auto_rounded
-
-def _avg_future_outdoor(weather_entity, outdoor_entity):
-    attrs = state.getattr(weather_entity) or {}
+def _read_forecast_list(forecast_sensor):
+    if not forecast_sensor:
+        return []
+    try:
+        attrs = state.getattr(forecast_sensor) or {}
+    except Exception:
+        return []
     fc = attrs.get("forecast") or []
+    return fc if isinstance(fc, list) else []
+
+def _avg_future_outdoor_from_hourly_forecast(forecast_sensor, outdoor_entity):
+    fc = _read_forecast_list(forecast_sensor)
     temps = []
     idx = 0
     for f in fc:
         if idx >= FORECAST_H:
             break
         t = f.get("temperature")
-        if t is not None:
-            try:
-                tv = float(t)
-                if isfinite(tv):
-                    temps.append(tv)
-                    idx += 1
-            except Exception:
-                pass
+        if t is None:
+            continue
+        try:
+            tv = float(t)
+            if isfinite(tv):
+                temps.append(tv)
+                idx += 1
+        except Exception:
+            pass
     if len(temps) > 0:
         s = 0.0
         for v in temps:
@@ -373,6 +358,88 @@ def _avg_future_outdoor(weather_entity, outdoor_entity):
         return v if isfinite(v) else 0.0
     except Exception:
         return 0.0
+
+def _read_current_humidity_from_hourly_forecast(forecast_sensor, fallback_weather_entity=None):
+    fc = _read_forecast_list(forecast_sensor)
+    if len(fc) > 0:
+        h = fc[0].get("humidity")
+        if h is not None:
+            try:
+                hv = float(h)
+                if isfinite(hv):
+                    return _clip(hv, 0.0, 100.0)
+            except Exception:
+                pass
+
+    if fallback_weather_entity:
+        try:
+            attrs = state.getattr(fallback_weather_entity) or {}
+            h = attrs.get("humidity")
+            if h is not None:
+                hv = float(h)
+                if isfinite(hv):
+                    return _clip(hv, 0.0, 100.0)
+        except Exception:
+            pass
+    return None
+
+def _read_current_wind_speed_from_hourly_forecast(forecast_sensor):
+    """Read wind_speed from forecast[0].wind_speed if available."""
+    fc = _read_forecast_list(forecast_sensor)
+    if len(fc) > 0:
+        w = fc[0].get("wind_speed")
+        if w is not None:
+            try:
+                wv = float(w)
+                if isfinite(wv):
+                    return max(0.0, wv)
+            except Exception:
+                pass
+    return None
+
+def _humidity_norm(h_pct):
+    if h_pct is None:
+        return 0.0
+    return _clip((float(h_pct) - 65.0) / 50.0, -1.0, 1.0)
+
+def _wind_norm(w_speed):
+    """Normalize wind_speed to [0..1] using WIND_SPEED_HIGH."""
+    if w_speed is None:
+        return 0.0
+    if WIND_SPEED_HIGH <= WIND_SPEED_LOW:
+        return 0.0
+    return _clip((float(w_speed) - WIND_SPEED_LOW) / (WIND_SPEED_HIGH - WIND_SPEED_LOW), 0.0, 1.0)
+
+def _cold_factor(Tout_raw):
+    """Cold factor [0..1]: 0 above WIND_COLD_START_C, 1 at/colder than WIND_COLD_FULL_C."""
+    if not isfinite(Tout_raw):
+        return 0.0
+    if WIND_COLD_FULL_C >= WIND_COLD_START_C:
+        return 0.0
+    if Tout_raw >= WIND_COLD_START_C:
+        return 0.0
+    if Tout_raw <= WIND_COLD_FULL_C:
+        return 1.0
+    # linear between start and full
+    return _clip((float(WIND_COLD_START_C) - float(Tout_raw)) / (float(WIND_COLD_START_C) - float(WIND_COLD_FULL_C)), 0.0, 1.0)
+
+def _icing_defrost_risk(Tout_raw, humidity_pct, in_icing_band):
+    if humidity_pct is None:
+        hum_risk = 0.0
+    else:
+        hum_risk = _clip((float(humidity_pct) - HUMIDITY_LOW_PCT) / (HUMIDITY_HIGH_PCT - HUMIDITY_LOW_PCT), 0.0, 1.0)
+
+    if not isfinite(Tout_raw):
+        temp_risk = 0.0
+    else:
+        dist = abs(float(Tout_raw) - float(ICING_RISK_CENTER_C))
+        temp_risk = 1.0 - _clip(dist / float(ICING_RISK_HALF_WIDTH_C), 0.0, 1.0)
+
+    if not in_icing_band:
+        return 0.0, float(hum_risk), float(temp_risk)
+
+    risk = _clip(float(hum_risk) * float(temp_risk), 0.0, 1.0)
+    return float(risk), float(hum_risk), float(temp_risk)
 
 def _read_bool(entity_id, default=True):
     try:
@@ -447,7 +514,6 @@ def _set_input_number_value(entity_id, value):
     except Exception as e:
         log.debug("Daikin ML: could not set %s. err=%s", entity_id, e)
 
-# NOTE (existing change): direction parameter added so we can force snapping DOWN when cap-limited.
 def _apply_demand(unit_name, select_entity, target_percent, prev_str, direction=0):
     option = _snap_to_select(select_entity, float(target_percent), direction)
     if option and option != prev_str:
@@ -501,7 +567,6 @@ def _price_bias_to_setpoint_delta_c(points):
     return float(frac) * float(PRICE_BIAS_MAX_SETPOINT_DELTA_C)
 
 def _read_temp_guard(unit):
-    """Return (min_temp, max_temp, min_ent, max_ent) using defaults if missing."""
     min_ent = unit.get("MIN_TEMP_HELPER")
     max_ent = unit.get("MAX_TEMP_HELPER")
 
@@ -525,9 +590,7 @@ def _read_temp_guard(unit):
             pass
 
     if min_v > max_v:
-        tmp = min_v
-        min_v = max_v
-        max_v = tmp
+        min_v, max_v = max_v, min_v
 
     return float(min_v), float(max_v), str(min_ent), str(max_ent)
 
@@ -548,7 +611,6 @@ def _confidence_from(count, P):
     norm_trace = _clip(norm_trace, 0.0, 10.0)
 
     c_p = 1.0 / (1.0 + CONF_P_NORM_SCALE * norm_trace)
-
     conf = _clip(c_count * (2.0 * c_p), 0.0, CONF_MAX)
     return float(conf), float(tr), float(norm_trace), float(c_count), float(c_p)
 
@@ -594,7 +656,6 @@ def _load_params_from_store(unit):
     store = unit["STORE_ENTITY"]
     attrs = state.getattr(store) or {}
 
-    # --- load theta_by_ctx (existing) ---
     tb = attrs.get("theta_by_ctx")
     new = {}
     if isinstance(tb, dict):
@@ -609,7 +670,6 @@ def _load_params_from_store(unit):
     if new:
         _theta_by_unit_ctx[unit_name] = new
 
-    # --- NEW: load updates_by_ctx (persisted confidence map) ---
     ub = attrs.get("updates_by_ctx")
     upd_new = {}
     if isinstance(ub, dict):
@@ -641,7 +701,6 @@ def _save_params_to_store(unit):
             round(float(th[3]), 4),
         ]
 
-    # NEW: persist ctx update counts too
     upd_clean = {}
     for key, v in (_updates_by_unit_ctx.get(unit_name) or {}).items():
         try:
@@ -675,7 +734,6 @@ def _init_context_params_if_needed(unit):
                                         [0, P0, 0, 0],
                                         [0, 0, P0, 0],
                                         [0, 0, 0, P0]]
-        # NEW: keep loaded update counts; only default to 0 if missing
         if k not in (_updates_by_unit_ctx.get(unit_name) or {}):
             _updates_by_unit_ctx[unit_name][k] = 0
 
@@ -729,7 +787,10 @@ def _run_one_unit(u):
     INDOOR = u["INDOOR"]
     INDOOR_RATE = u["INDOOR_RATE"]
     OUTDOOR = u["OUTDOOR"]
+
     WEATHER = u["WEATHER"]
+    FORECAST_HOURLY = u.get("FORECAST_HOURLY")
+
     SELECT = u["SELECT"]
     LIQUID = u["LIQUID"]
 
@@ -767,10 +828,13 @@ def _run_one_unit(u):
     else:
         rate_bad = False
 
-    # --- Nord Pool bias points ---
+    humidity_pct = _read_current_humidity_from_hourly_forecast(FORECAST_HOURLY, fallback_weather_entity=WEATHER)
+
+    # NEW: wind speed (from forecast)
+    wind_speed = _read_current_wind_speed_from_hourly_forecast(FORECAST_HOURLY)
+
     price_bias = _read_price_bias_points(u)
 
-    # --- Base setpoint (new) + effective setpoint written to SP_HELPER (literal) ---
     base_sp = None
     if SP_BASE_HELPER:
         try:
@@ -793,10 +857,7 @@ def _run_one_unit(u):
     sp_delta = _price_bias_to_setpoint_delta_c(price_bias)
     sp_effective = _clip(base_sp + sp_delta, PRICE_BIAS_SETPOINT_MIN_C, PRICE_BIAS_SETPOINT_MAX_C)
 
-    # Write effective setpoint so it is visible in HA logs/history (literal change)
     _set_input_number_value(SP_HELPER, round(float(sp_effective), 2))
-
-    # Use effective setpoint for control
     sp = float(sp_effective)
 
     step_limit_current = float(state.get(STEP_LIMIT_HELPER) or 10.0)
@@ -807,8 +868,6 @@ def _run_one_unit(u):
         prev = float(prev_str.replace('%', ''))
     except Exception:
         prev = 60.0
-
-    quiet_prev = _quiet_is_on(QUIET_SWITCH) if quiet_available else False
 
     try:
         liquid = float(state.get(LIQUID) or 100.0)
@@ -868,10 +927,7 @@ def _run_one_unit(u):
 
     step_limit, deadband = _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_current)
 
-    if Tout_bucket <= -5:
-        global_upper = MAX_DEM
-    else:
-        global_upper = GLOBAL_MILD_MAX
+    global_upper = MAX_DEM if Tout_bucket <= -5 else GLOBAL_MILD_MAX
 
     try:
         icing_cap = float(state.get(ICING_CAP_HELPER) or ICING_BAND_CAP_DEFAULT)
@@ -882,7 +938,17 @@ def _run_one_unit(u):
     icing_cap = _clip(icing_cap, MIN_DEM, MAX_DEM)
 
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
-    band_upper = min(global_upper, icing_cap) if in_icing_band else global_upper
+
+    risk, hum_risk, temp_risk = _icing_defrost_risk(Tout_raw, humidity_pct, in_icing_band)
+    defrost_predicted = (risk >= DEFROST_RISK_THRESHOLD)
+
+    if in_icing_band:
+        cap_reduction = 1.0 - (DYNAMIC_CAP_MAX_REDUCTION_FRAC * risk)
+        icing_cap_dynamic = _clip(icing_cap * cap_reduction, MIN_DEM, icing_cap)
+        band_upper = min(global_upper, icing_cap_dynamic)
+    else:
+        icing_cap_dynamic = icing_cap
+        band_upper = global_upper
 
     if prev > band_upper:
         if quiet_available:
@@ -897,7 +963,14 @@ def _run_one_unit(u):
 
     err         = sp - Tin
     demand_norm = _clip(prev_eff / 100.0, 0.0, 1.0)
-    x = [1.0, err, demand_norm, (Tout_raw - Tin)]
+
+    # Inject humidity + wind into x[3] without changing theta dimension
+    hnorm = _humidity_norm(humidity_pct)
+    wnorm = _wind_norm(wind_speed)
+    cold = _cold_factor(Tout_raw)
+    wind_cold_factor = wnorm * cold
+
+    x = [1.0, err, demand_norm, (Tout_raw - Tin) + (HUMIDITY_FEATURE_K * hnorm) + (WIND_FEATURE_K * wind_cold_factor)]
     y = rate
 
     allow_learning = (
@@ -905,6 +978,7 @@ def _run_one_unit(u):
         and (not defrosting)
         and (not in_cooldown)
         and (not rate_bad)
+        and (not defrost_predicted)
     )
 
     if allow_learning:
@@ -931,7 +1005,7 @@ def _run_one_unit(u):
     if blend_factor < CONF_FREEZE_THRESHOLD:
         blend_factor = 0.0
 
-    Tout_future = _avg_future_outdoor(WEATHER, OUTDOOR)
+    Tout_future = _avg_future_outdoor_from_hourly_forecast(FORECAST_HOURLY, OUTDOOR)
     Tout_eff    = 0.5 * Tout_raw + 0.5 * Tout_future
     dTin_target = _clip(KAPPA * err / HORIZON_H, -2.0, 2.0)
 
@@ -950,7 +1024,6 @@ def _run_one_unit(u):
     if not isfinite(dem_opt):
         dem_opt = prev_eff
 
-    # --- learned sensor update (attrs always updated) ---
     try:
         if learning_enabled:
             learned_value = round(float(dem_opt), 1)
@@ -974,7 +1047,6 @@ def _run_one_unit(u):
             outdoor_bucket=Tout_bucket,
             outdoor=round(Tout_raw, 1),
 
-            # Setpoint now reflects literal (biased) SP_HELPER value
             setpoint=round(sp, 2),
             setpoint_base=round(float(base_sp), 2),
             setpoint_bias_delta=round(float(sp_delta), 3),
@@ -1004,14 +1076,29 @@ def _run_one_unit(u):
             conf_count_factor=round(float(c_count), 4),
             conf_p_factor=round(float(c_p), 4),
 
+            humidity_pct=(round(float(humidity_pct), 1) if humidity_pct is not None else None),
+            wind_speed=(round(float(wind_speed), 2) if wind_speed is not None else None),
+            wind_norm=round(float(wnorm), 4),
+            cold_factor=round(float(cold), 4),
+            wind_cold_factor=round(float(wind_cold_factor), 4),
+
+            icing_band=bool(in_icing_band),
+            icing_risk=round(float(risk), 4),
+            icing_risk_humidity=round(float(hum_risk), 4),
+            icing_risk_temperature=round(float(temp_risk), 4),
+            defrost_predicted=bool(defrost_predicted),
+            icing_cap_base=round(float(icing_cap), 2),
+            icing_cap_dynamic=round(float(icing_cap_dynamic), 2),
+            band_upper=round(float(band_upper), 2),
+
+            forecast_hourly=str(FORECAST_HOURLY),
+            outdoor_future=round(float(Tout_future), 2),
+
             note=note,
         )
     except Exception as e:
         log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
 
-    # ============================================================
-    # HARD TEMPERATURE GUARD OVERRIDE ("no matter what")
-    # ============================================================
     temp_override = None
     if isfinite(min_temp) and Tin < min_temp:
         temp_override = "below_min"
@@ -1028,9 +1115,6 @@ def _run_one_unit(u):
 
         if err > deadband and dem_target < prev_eff:
             dem_target = prev_eff
-
-        # IMPORTANT CHANGE: price bias is now expressed via setpoint, not added to demand here.
-        # (No dem_target += price_bias)
 
         delta = dem_target - prev_eff
         if delta > 0:
@@ -1071,12 +1155,15 @@ def _run_one_unit(u):
         option = _apply_demand(unit_name, SELECT, dem_clip, prev_str, direction=snap_dir)
 
     log.info(
-        "Daikin ML (%s): ctx=%s Tin=%.2f Tout=%.2f sp_eff=%.2f sp_base=%.2f sp_d=%.3f err=%.2f | conf=%.3f blend=%.3f upd=%s P_tr=%.1f | "
-        "temp_guard=[%.2f..%.2f] override=%s | band_upper=%.0f quiet_avail=%s | dem_opt=%.1f price_bias_pts=%.2f -> dem_clip=%.1f -> %s",
-        unit_name, ctx, Tin, Tout_raw, float(sp), float(base_sp), float(sp_delta), err,
+        "Daikin ML (%s): ctx=%s Tin=%.2f Tout=%.2f Tout_f=%.2f hum=%s wind=%s wcf=%.3f risk=%.3f sp_eff=%.2f sp_base=%.2f sp_d=%.3f err=%.2f | conf=%.3f blend=%.3f upd=%s P_tr=%.1f | "
+        "cap_base=%.1f cap_dyn=%.1f band_upper=%.1f defrost_pred=%s | temp_guard=[%.2f..%.2f] override=%s | quiet_avail=%s | dem_opt=%.1f price_bias_pts=%.2f -> dem_clip=%.1f -> %s",
+        unit_name, ctx, Tin, Tout_raw, float(Tout_future),
+        str(humidity_pct), str(wind_speed), float(wind_cold_factor), float(risk),
+        float(sp), float(base_sp), float(sp_delta), err,
         float(confidence), float(blend_factor), str(upd_count), float(P_tr),
+        float(icing_cap), float(icing_cap_dynamic), float(band_upper), str(defrost_predicted),
         min_temp, max_temp, str(temp_override),
-        band_upper, str(quiet_available),
+        str(quiet_available),
         float(dem_opt), float(price_bias),
         float(dem_clip), str(option),
     )
