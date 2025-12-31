@@ -1,6 +1,7 @@
 # pyscript/daikin_ml_multi.py
 # Online-RLS Daikin demand controller with MULTI-DAIKIN support.
 #
+
 import time
 from math import isfinite
 
@@ -61,7 +62,6 @@ DAIKINS = [
         "COMP_FREQ_SENSOR": "sensor.faikin_comp",
 
         # Optional price sensor for volatility-aware window (ONLY if exists)
-        # Must be an entity that has list-like prices accessible via attributes or state JSON.
         "PRICE_SENSOR": "sensor.day_ahead_price",
     },
 ]
@@ -110,8 +110,8 @@ CONF_FREEZE_THRESHOLD = 0.15
 CONF_MAX = 1.0
 
 # Confidence-driven step scaling
-CONF_STEP_MIN_SCALE = 0.4   # at very low confidence, step_limit scaled down
-CONF_STEP_MAX_SCALE = 1.0   # at high confidence, unchanged
+CONF_STEP_MIN_SCALE = 0.4
+CONF_STEP_MAX_SCALE = 1.0
 
 # ============================================================
 # Price bias -> setpoint delta mapping
@@ -121,9 +121,8 @@ PRICE_BIAS_MAX_SETPOINT_DELTA_C = 0.5
 PRICE_BIAS_SETPOINT_MIN_C = 5.0
 PRICE_BIAS_SETPOINT_MAX_C = 30.0
 
-# Setpoint ramp limiting (per tick) - reduces oscillation/cycling.
-# Controller runs every ~6 min + triggers; treat as "tick".
-SETPOINT_RAMP_MAX_DELTA_C_PER_TICK = 0.10  # allow max 0.10°C per run
+# Setpoint ramp limiting
+SETPOINT_RAMP_MAX_DELTA_C_PER_TICK = 0.10
 
 # ============================================================
 # Humidity -> defrost/icing risk + learning feature injection
@@ -139,13 +138,13 @@ DYNAMIC_CAP_MAX_REDUCTION_FRAC = 0.25
 # Frost/defrost prediction
 DEFROST_RISK_THRESHOLD = 0.60
 FROST_INTEGRATOR_THRESHOLD = 1.0
-FROST_INTEGRATOR_DECAY_PER_H = 0.10  # decay per hour
-FROST_INTEGRATOR_GAIN = 0.50         # how fast integrator accumulates
-FROST_INTEGRATOR_MIN_SECONDS = 10.0  # ignore too-frequent ticks
+FROST_INTEGRATOR_DECAY_PER_H = 0.10
+FROST_INTEGRATOR_GAIN = 0.50
+FROST_INTEGRATOR_MIN_SECONDS = 10.0
 
-# Dynamic icing cap hysteresis (fast clamp, slow release)
-CAP_HYST_RELEASE_PER_H = 0.20  # release towards base icing cap per hour
-CAP_HYST_CLAMP_FAST_FACTOR = 1.0  # immediate clamp to dynamic cap
+# Dynamic icing cap hysteresis
+CAP_HYST_RELEASE_PER_H = 0.20
+CAP_HYST_CLAMP_FAST_FACTOR = 1.0
 
 HUMIDITY_FEATURE_K = 0.05
 
@@ -168,34 +167,35 @@ NORDPOOL_HARSH_TEMP_FULL_C = -10.0
 NORDPOOL_SEV_TEMP_WEIGHT = 0.75
 NORDPOOL_SEV_WIND_WEIGHT = 0.25
 
-# Optional volatility influence (only if price list is available)
-VOLATILITY_LOOKAHEAD_SLOTS = 16  # 16*15min = 4h
+VOLATILITY_LOOKAHEAD_SLOTS = 16
 VOLATILITY_MIN_STD = 0.0
-VOLATILITY_MAX_STD = 15.0  # cents/MWh-ish scaling; will be normalized; safe even if units differ
-VOLATILITY_WINDOW_SHRINK_WEIGHT = 0.40  # reduce window when volatile (blended into severity)
+VOLATILITY_MAX_STD = 15.0
+VOLATILITY_WINDOW_SHRINK_WEIGHT = 0.40
 
 # ============================================================
-# Steady-state learning gate
+# Steady-state learning gate (SOFTENED NOW)
 # ============================================================
-STEADY_AFTER_CHANGE_SECONDS = 12 * 60  # require 12 minutes after demand/setpoint changes
-RATE_STEADY_MAX_ABS = 0.02            # if indoor rate too high => not steady (°C/min or unit-specific)
-ERR_STEADY_MAX_ABS = 1.0              # if error too big => not steady for learning
+# Softer timing + higher tolerances, and allow learning when close to setpoint even if timers not met.
+STEADY_AFTER_CHANGE_SECONDS = 6 * 60   # was 12 min
+RATE_STEADY_MAX_ABS = 0.05             # was 0.02
+ERR_STEADY_MAX_ABS = 1.5               # was 1.0
+STEADY_NEAR_SETPOINT_ERR = 0.35        # new "soft bypass" threshold
 
 # ============================================================
 # Theta anomaly guard + freeze
 # ============================================================
 THETA_ABS_MAX = 50.0
 THETA_MIN_DENOM_MAG = 0.1
-ANOMALY_FREEZE_SECONDS = 3 * 60 * 60  # 3 hours freeze per ctx if anomaly detected
+ANOMALY_FREEZE_SECONDS = 3 * 60 * 60
 
 # ============================================================
-# Gentle exploration micro-dither (only when safe)
+# Gentle exploration micro-dither
 # ============================================================
 EXPLORATION_ENABLED = True
-EXPLORATION_MAX_DELTA_DEM = 1.0     # +/- 1%
-EXPLORATION_ERR_MAX = 0.4           # only when near setpoint
-EXPLORATION_MIN_CONF = 0.25         # only when confidence low
-EXPLORATION_MIN_SECONDS = 30 * 60   # at most every 30 minutes per ctx
+EXPLORATION_MAX_DELTA_DEM = 1.0
+EXPLORATION_ERR_MAX = 0.4
+EXPLORATION_MIN_CONF = 0.25
+EXPLORATION_MIN_SECONDS = 30 * 60
 
 # ============================================================
 # 3) HELPERS
@@ -692,7 +692,6 @@ def _confidence_from(count, P):
 
 def _confidence_step_scale(conf):
     c = _clip(float(conf), 0.0, 1.0)
-    # Low conf -> smaller steps, high conf -> normal
     return float(CONF_STEP_MIN_SCALE + (CONF_STEP_MAX_SCALE - CONF_STEP_MIN_SCALE) * c)
 
 def _nordpool_severity_from_conditions(Tout_raw, wind_cold_factor):
@@ -744,7 +743,6 @@ def _theta_anomalous(theta):
     for v in theta:
         if abs(float(v)) > THETA_ABS_MAX:
             return True
-    # denom magnitude sanity
     try:
         if abs(float(theta[2])) < THETA_MIN_DENOM_MAG:
             return True
@@ -753,12 +751,6 @@ def _theta_anomalous(theta):
     return False
 
 def _extract_price_list(price_sensor):
-    """Best-effort optional extraction of 15m-ish price list from an entity.
-    Accepts:
-      - attributes: prices / price / raw_today / raw_tomorrow / data / etc (list of numbers)
-      - state as JSON-like string list -> ignored (we avoid json parsing to keep pyscript simple)
-    Returns list[float] or [].
-    """
     if not price_sensor or (not _entity_exists(price_sensor)):
         return []
     attrs = state.getattr(price_sensor) or {}
@@ -802,7 +794,6 @@ def _why_add(why_list, s):
     if s:
         why_list.append(str(s))
 
-
 # ============================================================
 # 4) STATE (per unit)
 # ============================================================
@@ -816,16 +807,15 @@ _last_resort_since = {}
 
 _updates_by_unit_ctx = {}
 
-# new states for "everything"
-_frost_integrator = {}         # per unit
-_last_tick_ts = {}             # per unit
-_last_demand_change_ts = {}    # per unit (select change)
-_last_setpoint_write_ts = {}   # per unit (SP_HELPER writes)
-_last_sp_written = {}          # per unit
-_cap_hyst_upper = {}           # per unit (smoothed band_upper in icing band)
-_freeze_until_by_ctx = {}      # per unit -> dict ctx->timestamp
-_exploration_last_ts = {}      # per unit -> dict ctx->timestamp
-_exploration_phase = {}        # per unit -> +/-1
+_frost_integrator = {}
+_last_tick_ts = {}
+_last_demand_change_ts = {}
+_last_setpoint_write_ts = {}
+_last_sp_written = {}
+_cap_hyst_upper = {}
+_freeze_until_by_ctx = {}
+_exploration_last_ts = {}
+_exploration_phase = {}
 
 def _persist_all_stores():
     for u in DAIKINS:
@@ -982,7 +972,6 @@ def _init_context_params_if_needed(unit):
 
     _params_loaded[unit_name] = True
 
-
 # ============================================================
 # 5) STARTUP + TRIGGERS
 # ============================================================
@@ -995,11 +984,11 @@ for u in DAIKINS:
         if ent:
             _TRIGGER_ENTITIES.append(ent)
 
-    # optional: trigger on power/frequency if present
-    for k in ("POWER_SENSOR", "COMP_FREQ_SENSOR"):
-        ent = u.get(k)
-        if ent:
-            _TRIGGER_ENTITIES.append(ent)
+    # CHANGE NOW: DO NOT trigger on POWER_SENSOR (runs too often)
+    # Keep COMP_FREQ_SENSOR trigger as-is.
+    ent = u.get("COMP_FREQ_SENSOR")
+    if ent:
+        _TRIGGER_ENTITIES.append(ent)
 
 @time_trigger("startup")
 def _ml_startup_ok():
@@ -1024,7 +1013,6 @@ def daikin_ml_controller(**kwargs):
             _run_one_unit(u)
         except Exception as e:
             log.error("Daikin ML (%s): controller error: %s", u.get("name", "?"), e)
-
 
 # ============================================================
 # 6) CONTROL LOGIC (per unit)
@@ -1062,20 +1050,16 @@ def _run_one_unit(u):
 
     now = time.time()
 
-    # tick dt (for integrators/hysteresis)
     last_ts = float(_last_tick_ts.get(unit_name, 0.0) or 0.0)
     dt = max(0.0, now - last_ts) if last_ts > 0 else 0.0
     _last_tick_ts[unit_name] = now
 
-    # base learning enable state from helpers
     learning_enabled = _learning_enabled_for_unit(u)
 
-    # fireplace ON => disable learning
     fireplace_on = _fireplace_is_on()
     if fireplace_on:
         learning_enabled = False
 
-    # read sensors
     try:
         Tin = float(state.get(INDOOR))
     except Exception:
@@ -1105,10 +1089,8 @@ def _run_one_unit(u):
     cold = _cold_factor(Tout_raw)
     wind_cold_factor = wnorm * cold
 
-    # --- Dynamic Nordpool avg window + volatility (optional) ---
     nordpool_sev_base = _nordpool_severity_from_conditions(Tout_raw, wind_cold_factor)
 
-    # Optional volatility component
     price_list = _extract_price_list(PRICE_SENSOR)
     vol_norm, vol_std = _volatility_norm_from_prices(price_list, VOLATILITY_LOOKAHEAD_SLOTS)
     nordpool_sev = _clip(nordpool_sev_base + VOLATILITY_WINDOW_SHRINK_WEIGHT * vol_norm, 0.0, 1.0)
@@ -1125,10 +1107,8 @@ def _run_one_unit(u):
     else:
         nordpool_avg_window_h = None
 
-    # --- Nordpool bias points ---
     price_bias = _read_price_bias_points(u)
 
-    # --- Base setpoint + biased setpoint target ---
     base_sp = None
     if SP_BASE_HELPER:
         try:
@@ -1151,10 +1131,8 @@ def _run_one_unit(u):
     sp_delta = _price_bias_to_setpoint_delta_c(price_bias)
     sp_target = _clip(base_sp + sp_delta, PRICE_BIAS_SETPOINT_MIN_C, PRICE_BIAS_SETPOINT_MAX_C)
 
-    # --- Setpoint ramp limiting (actual write) ---
     prev_sp_written = _last_sp_written.get(unit_name)
     if prev_sp_written is None:
-        # try reading current helper to establish baseline
         try:
             cur_sp_val = float(state.get(SP_HELPER) or sp_target)
             prev_sp_written = cur_sp_val if isfinite(cur_sp_val) else sp_target
@@ -1178,10 +1156,8 @@ def _run_one_unit(u):
     _last_sp_written[unit_name] = float(sp_write)
     _last_setpoint_write_ts[unit_name] = now
 
-    # Use written setpoint for control
     sp = float(sp_write)
 
-    # Read control helpers
     step_limit_current = float(state.get(STEP_LIMIT_HELPER) or 10.0)
     deadband_current   = float(state.get(DEADBAND_HELPER) or 0.1)
 
@@ -1191,9 +1167,6 @@ def _run_one_unit(u):
     except Exception:
         prev = 60.0
 
-    # Detect demand (select) change for steady-state gating
-    # (We don’t know “who” changed it; any change restarts steady timer)
-    # Track last applied option string as baseline
     last_seen_option = getattr(_run_one_unit, "__last_seen_option_" + unit_name, None)
     if last_seen_option is None:
         setattr(_run_one_unit, "__last_seen_option_" + unit_name, prev_str)
@@ -1202,7 +1175,6 @@ def _run_one_unit(u):
         _last_demand_change_ts[unit_name] = now
         setattr(_run_one_unit, "__last_seen_option_" + unit_name, prev_str)
 
-    # Defrost detect
     try:
         liquid = float(state.get(LIQUID) or 100.0)
     except Exception:
@@ -1214,10 +1186,8 @@ def _run_one_unit(u):
     if _last_defrosting[unit_name] is None:
         _last_defrosting[unit_name] = defrosting
 
-    # cooldown starts at beginning of defrost
     if (_last_defrosting[unit_name] is False) and (defrosting is True):
         _cooldown_until[unit_name] = now + COOLDOWN_MINUTES * 60.0
-        # reset frost integrator on actual defrost start
         _frost_integrator[unit_name] = 0.0
 
     _last_defrosting[unit_name] = defrosting
@@ -1248,7 +1218,6 @@ def _run_one_unit(u):
     theta = _theta_by_unit_ctx[unit_name][ctx]
     P     = _P_by_unit_ctx[unit_name][ctx]
 
-    # Theta anomaly guard: freeze learning for this ctx if abnormal
     if _theta_anomalous(theta):
         _freeze_until_by_ctx[unit_name][ctx] = max(float(_freeze_until_by_ctx[unit_name].get(ctx, 0.0) or 0.0), now + ANOMALY_FREEZE_SECONDS)
         theta = [0.0, 0.0, 5.0, 0.0]
@@ -1267,7 +1236,6 @@ def _run_one_unit(u):
     if blend_factor < CONF_FREEZE_THRESHOLD:
         blend_factor = 0.0
 
-    # confidence-driven step scaling
     step_scale = _confidence_step_scale(confidence)
 
     step_limit_auto, deadband_auto = _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_current)
@@ -1286,18 +1254,13 @@ def _run_one_unit(u):
 
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
 
-    # Base icing risk
     risk, hum_risk, temp_risk = _icing_defrost_risk(Tout_raw, humidity_pct, in_icing_band)
 
-    # Frost integrator (better defrost prediction)
-    # Accumulate only if dt is reasonable (avoid trigger storms)
     frost_int = float(_frost_integrator.get(unit_name, 0.0) or 0.0)
     if dt >= FROST_INTEGRATOR_MIN_SECONDS:
-        # decay
         decay = float(FROST_INTEGRATOR_DECAY_PER_H) * (dt / 3600.0)
         frost_int = max(0.0, frost_int - decay)
 
-        # accumulate (only in icing band-ish)
         accum = float(FROST_INTEGRATOR_GAIN) * float(risk) * (dt / 3600.0)
         frost_int = _clip(frost_int + accum, 0.0, 10.0)
 
@@ -1305,27 +1268,23 @@ def _run_one_unit(u):
 
     defrost_predicted = (risk >= DEFROST_RISK_THRESHOLD) or (frost_int >= FROST_INTEGRATOR_THRESHOLD)
 
-    # Dynamic icing cap (risk-based)
     if in_icing_band:
         cap_reduction = 1.0 - (DYNAMIC_CAP_MAX_REDUCTION_FRAC * risk)
         icing_cap_dynamic_raw = _clip(icing_cap_base * cap_reduction, MIN_DEM, icing_cap_base)
         band_upper_raw = min(global_upper, icing_cap_dynamic_raw)
 
-        # Hysteresis: clamp quickly, release slowly back up
         prev_h = _cap_hyst_upper.get(unit_name)
         if prev_h is None or (not isfinite(float(prev_h))):
             band_upper = band_upper_raw
         else:
-            # if new cap is lower => clamp immediately
             if band_upper_raw < float(prev_h):
                 band_upper = band_upper_raw * CAP_HYST_CLAMP_FAST_FACTOR + float(prev_h) * (1.0 - CAP_HYST_CLAMP_FAST_FACTOR)
             else:
-                # release slowly towards raw upper
                 release = float(CAP_HYST_RELEASE_PER_H) * (dt / 3600.0) if dt > 0 else 0.0
                 band_upper = float(prev_h) + release * (band_upper_raw - float(prev_h))
-                band_upper = min(band_upper_raw, band_upper)  # never exceed raw target in one step
+                band_upper = min(band_upper_raw, band_upper)
         _cap_hyst_upper[unit_name] = float(band_upper)
-        icing_cap_dynamic = float(band_upper)  # for reporting
+        icing_cap_dynamic = float(band_upper)
     else:
         icing_cap_dynamic = icing_cap_base
         band_upper = global_upper
@@ -1333,7 +1292,6 @@ def _run_one_unit(u):
 
     band_upper = _clip(float(band_upper), MIN_DEM, MAX_DEM)
 
-    # If currently above cap, snap DOWN immediately (prevents "jump over cap")
     if prev > band_upper:
         if quiet_available:
             _set_quiet(QUIET_SWITCH, False, unit_name)
@@ -1346,25 +1304,28 @@ def _run_one_unit(u):
 
     prev_eff = prev if prev <= band_upper else band_upper
 
-    # Control error uses ramped setpoint
     err = sp - Tin
 
     demand_norm = _clip(prev_eff / 100.0, 0.0, 1.0)
     hnorm = _humidity_norm(humidity_pct)
-    x = [1.0, err, demand_norm, (Tout_raw - Tin) + (HUMIDITY_FEATURE_K * hnorm) + (WIND_FEATURE_K * wind_cold_factor)]
+    x = [1.0, err, demand_norm, (Tout_raw - Tin) + (HUMIDITY_FEATURE_K * hnorm) + (WIND_FEATURE_K * (wnorm * cold))]
     y = rate
 
-    # Steady-state gate
     since_dem_change = now - float(_last_demand_change_ts.get(unit_name, 0.0) or 0.0)
     since_sp_write = now - float(_last_setpoint_write_ts.get(unit_name, 0.0) or 0.0)
+
+    # CHANGE NOW: softer steady gate (near setpoint bypass)
+    near_setpoint = (abs(err) <= STEADY_NEAR_SETPOINT_ERR)
     steady_ok = (
-        (since_dem_change >= STEADY_AFTER_CHANGE_SECONDS)
-        and (since_sp_write >= STEADY_AFTER_CHANGE_SECONDS)
-        and (abs(rate) <= RATE_STEADY_MAX_ABS)
-        and (abs(err) <= ERR_STEADY_MAX_ABS)
+        near_setpoint
+        or (
+            (since_dem_change >= STEADY_AFTER_CHANGE_SECONDS)
+            and (since_sp_write >= STEADY_AFTER_CHANGE_SECONDS)
+            and (abs(rate) <= RATE_STEADY_MAX_ABS)
+            and (abs(err) <= ERR_STEADY_MAX_ABS)
+        )
     )
 
-    # Per-ctx freeze timer (anomaly or auto-freeze event)
     freeze_until = float(_freeze_until_by_ctx[unit_name].get(ctx, 0.0) or 0.0)
     frozen_ctx = (now < freeze_until)
 
@@ -1390,7 +1351,6 @@ def _run_one_unit(u):
             _updates_by_unit_ctx[unit_name][ctx] = int(_updates_by_unit_ctx[unit_name].get(ctx, 0) or 0) + 1
             _save_params_to_store(u)
         else:
-            # Freeze this ctx if learning produced garbage
             _theta_by_unit_ctx[unit_name][ctx] = theta_prev
             _P_by_unit_ctx[unit_name][ctx] = P_prev
             _freeze_until_by_ctx[unit_name][ctx] = max(float(_freeze_until_by_ctx[unit_name].get(ctx, 0.0) or 0.0), now + ANOMALY_FREEZE_SECONDS)
@@ -1424,8 +1384,6 @@ def _run_one_unit(u):
     if not isfinite(dem_opt):
         dem_opt = prev_eff
 
-    # Efficiency proxy (optional): W per °C/h
-    # If rate is °C/min -> convert to °C/h using *60; if it's already °C/h, still okay (just a metric).
     w_per_dth = None
     try:
         if power_w is not None and isfinite(power_w):
@@ -1435,7 +1393,6 @@ def _run_one_unit(u):
     except Exception:
         w_per_dth = None
 
-    # --- learned sensor update (attrs always updated) ---
     why = []
     _why_add(why, "fireplace_on" if fireplace_on else "")
     _why_add(why, "defrosting" if defrosting else "")
@@ -1548,9 +1505,6 @@ def _run_one_unit(u):
     except Exception as e:
         log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
 
-    # ============================================================
-    # HARD TEMPERATURE GUARD OVERRIDE ("no matter what")
-    # ============================================================
     temp_override = None
     if isfinite(min_temp) and Tin < min_temp:
         temp_override = "below_min"
@@ -1559,18 +1513,15 @@ def _run_one_unit(u):
         temp_override = "above_max"
         dem_clip = float(MIN_DEM)
     else:
-        # normal blending
         if abs(err) <= deadband:
             dem_target = prev_eff
         else:
             dem_blend = prev_eff + float(blend_factor) * (float(dem_opt) - float(prev_eff))
             dem_target = dem_blend
 
-        # never reduce demand when too cold
         if err > deadband and dem_target < prev_eff:
             dem_target = prev_eff
 
-        # cooldown / step limiting
         delta = dem_target - prev_eff
         if delta > 0:
             up_limit = COOLDOWN_STEP_UP if in_cooldown else step_limit
@@ -1583,7 +1534,6 @@ def _run_one_unit(u):
 
         dem_clip = _clip(dem_target, MIN_DEM, min(band_upper, 100.0))
 
-        # gentle exploration (only when safe, low confidence, near setpoint, not defrost/cooldown, not cap-limited)
         if EXPLORATION_ENABLED and (temp_override is None):
             if (confidence <= EXPLORATION_MIN_CONF) and (abs(err) <= EXPLORATION_ERR_MAX) and (not defrosting) and (not in_cooldown) and (not defrost_predicted) and (dem_clip < band_upper - 0.5):
                 last_exp = float(_exploration_last_ts[unit_name].get(ctx, 0.0) or 0.0)
@@ -1594,7 +1544,6 @@ def _run_one_unit(u):
                     _exploration_last_ts[unit_name][ctx] = now
                     _exploration_phase[unit_name] = -phase
 
-    # REAL 100% last resort gating (only with quiet)
     allow_real_100 = True
     want_full = (dem_clip >= 99.95) and (band_upper >= 100.0)
 
@@ -1613,17 +1562,14 @@ def _run_one_unit(u):
     else:
         _last_resort_since[unit_name] = 0.0
 
-    # snapping DOWN when cap-limited
     cap_limited = (dem_clip >= (float(band_upper) - 1e-9))
     snap_dir = -1 if cap_limited else 0
 
-    # Apply demand
     if quiet_available:
         option = _apply_demand_with_quiet(unit_name, SELECT, QUIET_SWITCH, dem_clip, prev_str, allow_real_100, direction=snap_dir)
     else:
         option = _apply_demand(unit_name, SELECT, dem_clip, prev_str, direction=snap_dir)
 
-    # If demand changed, update steady-state timer
     if option and option != prev_str:
         _last_demand_change_ts[unit_name] = now
 
@@ -1645,7 +1591,6 @@ def _run_one_unit(u):
         (str(round(w_per_dth, 2)) if w_per_dth is not None and isfinite(w_per_dth) else "None"),
         float(dem_opt), float(dem_clip), str(option),
     )
-
 
 # ============================================================
 # 7) SERVICES
@@ -1722,7 +1667,6 @@ def daikin_ml_learning_toggle():
             input_boolean.turn_on(entity_id=LEARNING_ENABLED_HELPER_GLOBAL)
     except Exception as e:
         log.error("Daikin ML: failed to toggle learning global: %s", e)
-
 
 # ============================================================
 # 8) PERSIST STORES AT LOAD
