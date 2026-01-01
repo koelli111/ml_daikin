@@ -124,6 +124,16 @@ PRICE_BIAS_SETPOINT_MAX_C = 30.0
 # Setpoint ramp limiting
 SETPOINT_RAMP_MAX_DELTA_C_PER_TICK = 0.10
 
+# Setpoint change detect epsilon
+SETPOINT_CHANGE_EPS_C = 0.01
+
+# ============================================================
+# Learned demand rounding
+# ============================================================
+VALID_DAIKIN_DEMANDS = [30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100]
+VALID_DAIKIN_DEMANDS_WITH_QUIET = VALID_DAIKIN_DEMANDS + [105]
+LEARNED_SHOW_105_THRESHOLD = 99.95  # if ML wants ~100 and REAL100 (quiet off) is allowed -> show 105
+
 # ============================================================
 # Humidity -> defrost/icing risk + learning feature injection
 # ============================================================
@@ -173,13 +183,12 @@ VOLATILITY_MAX_STD = 15.0
 VOLATILITY_WINDOW_SHRINK_WEIGHT = 0.40
 
 # ============================================================
-# Steady-state learning gate (SOFTENED NOW)
+# Steady-state learning gate (SOFTENED)
 # ============================================================
-# Softer timing + higher tolerances, and allow learning when close to setpoint even if timers not met.
-STEADY_AFTER_CHANGE_SECONDS = 6 * 60   # was 12 min
-RATE_STEADY_MAX_ABS = 0.05             # was 0.02
-ERR_STEADY_MAX_ABS = 1.5               # was 1.0
-STEADY_NEAR_SETPOINT_ERR = 0.35        # new "soft bypass" threshold
+STEADY_AFTER_CHANGE_SECONDS = 6 * 60
+RATE_STEADY_MAX_ABS = 0.05
+ERR_STEADY_MAX_ABS = 1.5
+STEADY_NEAR_SETPOINT_ERR = 0.35
 
 # ============================================================
 # Theta anomaly guard + freeze
@@ -196,6 +205,11 @@ EXPLORATION_MAX_DELTA_DEM = 1.0
 EXPLORATION_ERR_MAX = 0.4
 EXPLORATION_MIN_CONF = 0.25
 EXPLORATION_MIN_SECONDS = 30 * 60
+
+# ============================================================
+# Demand dwell / freeze after change
+# ============================================================
+DEMAND_CHANGE_FREEZE_SECONDS = 15 * 60
 
 # ============================================================
 # 3) HELPERS
@@ -237,6 +251,27 @@ def _all_finite(seq):
         except Exception:
             return False
     return True
+
+def _snap_to_valid_demand(value, quiet_available=False):
+    """Snap to nearest valid Daikin demand display step.
+    If quiet_available True -> allow 105 as a display step (meaning 100% quiet OFF)."""
+    try:
+        v = float(value)
+    except Exception:
+        v = float(MIN_DEM)
+    if not isfinite(v):
+        v = float(MIN_DEM)
+
+    opts = VALID_DAIKIN_DEMANDS_WITH_QUIET if quiet_available else VALID_DAIKIN_DEMANDS
+
+    best = opts[0]
+    bestd = abs(float(opts[0]) - v)
+    for o in opts:
+        d = abs(float(o) - v)
+        if d < bestd:
+            bestd = d
+            best = o
+    return int(best)
 
 def _dot(a, b):
     total = 0.0
@@ -597,9 +632,17 @@ def _apply_demand(unit_name, select_entity, target_percent, prev_str, direction=
     return option
 
 def _apply_demand_with_quiet(unit_name, select_entity, quiet_switch, target_percent, prev_str, allow_real_100, direction=0):
+    """
+    Supports a virtual 105 target when quiet is available:
+      - target >= 105  -> demand 100, quiet OFF
+      - target >= 100  -> demand 100, quiet ON (unless allow_real_100 => quiet OFF)
+    """
     t = float(target_percent)
 
-    if t >= 100.0:
+    if t >= 104.5:
+        _set_quiet(quiet_switch, False, unit_name)
+        option = _snap_to_select(select_entity, 100.0, direction)
+    elif t >= 99.5:
         if allow_real_100:
             _set_quiet(quiet_switch, False, unit_name)
             option = _snap_to_select(select_entity, 100.0, direction)
@@ -984,11 +1027,8 @@ for u in DAIKINS:
         if ent:
             _TRIGGER_ENTITIES.append(ent)
 
-    # CHANGE NOW: DO NOT trigger on POWER_SENSOR (runs too often)
-    # Keep COMP_FREQ_SENSOR trigger as-is.
-    ent = u.get("COMP_FREQ_SENSOR")
-    if ent:
-        _TRIGGER_ENTITIES.append(ent)
+    # DO NOT trigger on POWER_SENSOR
+    # DO NOT trigger on COMP_FREQ_SENSOR
 
 @time_trigger("startup")
 def _ml_startup_ok():
@@ -1109,6 +1149,29 @@ def _run_one_unit(u):
 
     price_bias = _read_price_bias_points(u)
 
+    # ------------------------------------------------------------
+    # Setpoint read + change detection (any setpoint change unfreezes demand)
+    # ------------------------------------------------------------
+    sp_current_state = None
+    try:
+        v = state.get(SP_HELPER)
+        if v is not None:
+            fv = float(v)
+            if isfinite(fv):
+                sp_current_state = fv
+    except Exception:
+        sp_current_state = None
+
+    prev_sp_written = _last_sp_written.get(unit_name)
+
+    setpoint_changed_any_reason = False
+    if (sp_current_state is not None) and (prev_sp_written is not None) and isfinite(prev_sp_written):
+        if abs(float(sp_current_state) - float(prev_sp_written)) >= float(SETPOINT_CHANGE_EPS_C):
+            setpoint_changed_any_reason = True
+
+    if prev_sp_written is None:
+        prev_sp_written = sp_current_state
+
     base_sp = None
     if SP_BASE_HELPER:
         try:
@@ -1121,23 +1184,18 @@ def _run_one_unit(u):
             base_sp = None
 
     if base_sp is None:
-        try:
-            base_sp = float(state.get(SP_HELPER) or 22.5)
-        except Exception:
+        if sp_current_state is not None:
+            base_sp = float(sp_current_state)
+        else:
             base_sp = 22.5
-        if not isfinite(base_sp):
-            base_sp = 22.5
+    if not isfinite(base_sp):
+        base_sp = 22.5
 
     sp_delta = _price_bias_to_setpoint_delta_c(price_bias)
     sp_target = _clip(base_sp + sp_delta, PRICE_BIAS_SETPOINT_MIN_C, PRICE_BIAS_SETPOINT_MAX_C)
 
-    prev_sp_written = _last_sp_written.get(unit_name)
-    if prev_sp_written is None:
-        try:
-            cur_sp_val = float(state.get(SP_HELPER) or sp_target)
-            prev_sp_written = cur_sp_val if isfinite(cur_sp_val) else sp_target
-        except Exception:
-            prev_sp_written = sp_target
+    if prev_sp_written is None or (not isfinite(prev_sp_written)):
+        prev_sp_written = sp_target
 
     sp_write = sp_target
     max_step = float(SETPOINT_RAMP_MAX_DELTA_C_PER_TICK)
@@ -1152,12 +1210,22 @@ def _run_one_unit(u):
 
     sp_write = _clip(sp_write, PRICE_BIAS_SETPOINT_MIN_C, PRICE_BIAS_SETPOINT_MAX_C)
     sp_write = round(float(sp_write), 2)
-    _set_input_number_value(SP_HELPER, sp_write)
+
+    wrote_setpoint_change = False
+    if sp_current_state is None or abs(float(sp_write) - float(sp_current_state)) >= float(SETPOINT_CHANGE_EPS_C):
+        _set_input_number_value(SP_HELPER, sp_write)
+        _last_setpoint_write_ts[unit_name] = now
+        wrote_setpoint_change = True
+
     _last_sp_written[unit_name] = float(sp_write)
-    _last_setpoint_write_ts[unit_name] = now
+    if wrote_setpoint_change:
+        setpoint_changed_any_reason = True
 
     sp = float(sp_write)
 
+    # ------------------------------------------------------------
+    # Read control helper settings
+    # ------------------------------------------------------------
     step_limit_current = float(state.get(STEP_LIMIT_HELPER) or 10.0)
     deadband_current   = float(state.get(DEADBAND_HELPER) or 0.1)
 
@@ -1167,6 +1235,7 @@ def _run_one_unit(u):
     except Exception:
         prev = 60.0
 
+    # Detect any external/manual/other-automation demand change and start the freeze timer from it
     last_seen_option = getattr(_run_one_unit, "__last_seen_option_" + unit_name, None)
     if last_seen_option is None:
         setattr(_run_one_unit, "__last_seen_option_" + unit_name, prev_str)
@@ -1308,13 +1377,12 @@ def _run_one_unit(u):
 
     demand_norm = _clip(prev_eff / 100.0, 0.0, 1.0)
     hnorm = _humidity_norm(humidity_pct)
-    x = [1.0, err, demand_norm, (Tout_raw - Tin) + (HUMIDITY_FEATURE_K * hnorm) + (WIND_FEATURE_K * (wnorm * cold))]
+    x = [1.0, err, demand_norm, (Tout_raw - Tin) + (HUMIDITY_FEATURE_K * hnorm) + (WIND_FEATURE_K * (_wind_norm(wind_speed) * _cold_factor(Tout_raw)))]
     y = rate
 
     since_dem_change = now - float(_last_demand_change_ts.get(unit_name, 0.0) or 0.0)
     since_sp_write = now - float(_last_setpoint_write_ts.get(unit_name, 0.0) or 0.0)
 
-    # CHANGE NOW: softer steady gate (near setpoint bypass)
     near_setpoint = (abs(err) <= STEADY_NEAR_SETPOINT_ERR)
     steady_ok = (
         near_setpoint
@@ -1384,15 +1452,55 @@ def _run_one_unit(u):
     if not isfinite(dem_opt):
         dem_opt = prev_eff
 
-    w_per_dth = None
-    try:
-        if power_w is not None and isfinite(power_w):
-            dth = abs(float(rate)) * 60.0
-            if dth > 0.05:
-                w_per_dth = float(power_w) / float(dth)
-    except Exception:
-        w_per_dth = None
+    # ----------------------------
+    # Quiet "real 100" gating
+    # ----------------------------
+    allow_real_100 = True
+    want_full = (dem_opt >= LEARNED_SHOW_105_THRESHOLD)
 
+    if quiet_available:
+        allow_real_100 = False
+        if want_full and (err > LAST_RESORT_MIN_ERR_C) and (not defrosting):
+            if _last_resort_since[unit_name] <= 0.0:
+                _last_resort_since[unit_name] = now
+            elapsed = now - _last_resort_since[unit_name]
+            if err >= LAST_RESORT_ERR_C:
+                allow_real_100 = True
+            elif elapsed >= (LAST_RESORT_MINUTES * 60.0):
+                allow_real_100 = True
+        else:
+            _last_resort_since[unit_name] = 0.0
+    else:
+        _last_resort_since[unit_name] = 0.0
+
+    # ------------------------------------------------------------
+    # Demand freeze timer debug (NEW)
+    # ------------------------------------------------------------
+    since_any_change = now - float(_last_demand_change_ts.get(unit_name, 0.0) or 0.0)
+    freeze_active_raw = (since_any_change >= 0.0) and (since_any_change < float(DEMAND_CHANGE_FREEZE_SECONDS))
+    freeze_bypassed_by_setpoint = bool(setpoint_changed_any_reason)
+    freeze_active = bool(freeze_active_raw and (not freeze_bypassed_by_setpoint))
+
+    freeze_remaining_s = 0.0
+    if freeze_active_raw:
+        freeze_remaining_s = max(0.0, float(DEMAND_CHANGE_FREEZE_SECONDS) - float(since_any_change))
+    if freeze_bypassed_by_setpoint:
+        freeze_remaining_s = 0.0
+
+    freeze_remaining_min = freeze_remaining_s / 60.0
+
+    # ------------------------------------------------------------
+    # Learned demand rounding
+    # ------------------------------------------------------------
+    learned_raw = float(dem_opt)
+    if quiet_available and allow_real_100 and (learned_raw >= LEARNED_SHOW_105_THRESHOLD):
+        learned_disp = 105
+    else:
+        learned_disp = _snap_to_valid_demand(learned_raw, quiet_available=False)
+
+    # ------------------------------------------------------------
+    # Update learned demand sensor (add freeze timer attrs NEW)
+    # ------------------------------------------------------------
     why = []
     _why_add(why, "fireplace_on" if fireplace_on else "")
     _why_add(why, "defrosting" if defrosting else "")
@@ -1400,27 +1508,28 @@ def _run_one_unit(u):
     _why_add(why, "defrost_predicted" if defrost_predicted else "")
     _why_add(why, "steady_gate" if (not steady_ok) else "")
     _why_add(why, "ctx_frozen" if frozen_ctx else "")
-    _why_add(why, "cap_limit" if (prev_eff >= band_upper - 1e-6) else "")
     _why_add(why, "conf_low" if (confidence < CONF_FREEZE_THRESHOLD) else "")
+    _why_add(why, "setpoint_changed_unfreeze" if setpoint_changed_any_reason else "")
+    _why_add(why, "learned105" if (learned_disp == 105) else "")
+    _why_add(why, "demand_freeze_active" if freeze_active else "")
 
     try:
         if learning_enabled:
-            learned_value = round(float(dem_opt), 1)
-            note = "learning enabled: value follows dem_opt"
+            learned_value = float(learned_disp)
+            note = "learning enabled: value snapped to Daikin demand steps"
         else:
             prev_val = state.get(LEARNED_SENSOR)
             try:
                 learned_value = float(prev_val)
                 if not isfinite(learned_value):
-                    learned_value = 0.0
+                    learned_value = float(learned_disp)
             except Exception:
-                learned_value = 0.0
-            learned_value = round(float(learned_value), 1)
+                learned_value = float(learned_disp)
             note = "learning disabled: value frozen, attributes updated"
 
         state.set(
             LEARNED_SENSOR,
-            value=learned_value,
+            value=round(float(learned_value), 1),
             unit=unit_name,
             ctx=ctx,
             outdoor_bucket=Tout_bucket,
@@ -1431,6 +1540,7 @@ def _run_one_unit(u):
             setpoint_base=round(float(base_sp), 2),
             setpoint_bias_delta=round(float(sp_delta), 3),
             setpoint_ramp_max_delta_per_tick=float(SETPOINT_RAMP_MAX_DELTA_C_PER_TICK),
+            setpoint_changed_any_reason=bool(setpoint_changed_any_reason),
 
             indoor=round(Tin, 2),
             err=round(float(err), 3),
@@ -1442,8 +1552,22 @@ def _run_one_unit(u):
             learning_allowed=bool(allow_learning),
             steady_ok=bool(steady_ok),
 
-            fireplace_switch=str(FIREPLACE_SWITCH),
-            fireplace_on=bool(fireplace_on),
+            quiet_available=bool(quiet_available),
+            allow_real_100=bool(allow_real_100),
+
+            learned_raw=round(float(learned_raw), 2),
+            learned_snapped=int(learned_disp),
+            learned_valid_steps=str(VALID_DAIKIN_DEMANDS),
+            learned_includes_105=bool(quiet_available),
+
+            # NEW: demand freeze debug timer
+            demand_freeze_window_s=float(DEMAND_CHANGE_FREEZE_SECONDS),
+            demand_freeze_active=bool(freeze_active),
+            demand_freeze_active_raw=bool(freeze_active_raw),
+            demand_freeze_bypassed_by_setpoint=bool(freeze_bypassed_by_setpoint),
+            demand_freeze_since_last_change_s=round(float(since_any_change), 1),
+            demand_freeze_remaining_s=round(float(freeze_remaining_s), 1),
+            demand_freeze_remaining_min=round(float(freeze_remaining_min), 2),
 
             price_bias_points=round(float(price_bias), 2),
             price_bias_helper=str(PRICE_BIAS_HELPER),
@@ -1456,13 +1580,6 @@ def _run_one_unit(u):
             nordpool_volatility_std=(round(float(vol_std), 4) if isfinite(vol_std) else None),
             nordpool_severity=round(float(nordpool_sev), 4),
             price_sensor=str(PRICE_SENSOR),
-
-            quiet_available=bool(quiet_available),
-
-            temp_guard_min=min_temp,
-            temp_guard_max=max_temp,
-            temp_guard_min_helper=min_ent,
-            temp_guard_max_helper=max_ent,
 
             confidence=round(float(confidence), 4),
             confidence_blend=round(float(blend_factor), 4),
@@ -1486,25 +1603,15 @@ def _run_one_unit(u):
             frost_integrator=round(float(frost_int), 4),
             defrost_predicted=bool(defrost_predicted),
 
-            icing_cap_base=round(float(icing_cap_base), 2),
-            icing_cap_dynamic=round(float(icing_cap_dynamic), 2),
-            band_upper=round(float(band_upper), 2),
-
-            outdoor_future=round(float(Tout_future), 2),
-            forecast_hourly=str(FORECAST_HOURLY),
-
-            power_sensor=str(POWER_SENSOR),
-            power_w=(round(float(power_w), 2) if power_w is not None and isfinite(power_w) else None),
-            comp_freq_sensor=str(COMP_FREQ_SENSOR),
-            comp_hz=(round(float(comp_hz), 2) if comp_hz is not None and isfinite(comp_hz) else None),
-            w_per_degC_per_h=(round(float(w_per_dth), 2) if w_per_dth is not None and isfinite(w_per_dth) else None),
-
             why=",".join(why),
             note=note,
         )
     except Exception as e:
         log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
 
+    # ------------------------------------------------------------
+    # Compute control target
+    # ------------------------------------------------------------
     temp_override = None
     if isfinite(min_temp) and Tin < min_temp:
         temp_override = "below_min"
@@ -1544,52 +1651,33 @@ def _run_one_unit(u):
                     _exploration_last_ts[unit_name][ctx] = now
                     _exploration_phase[unit_name] = -phase
 
-    allow_real_100 = True
-    want_full = (dem_clip >= 99.95) and (band_upper >= 100.0)
+    # Apply demand freeze (using debug-computed freeze_active)
+    must_override = (temp_override is not None)
+    if freeze_active and (not must_override):
+        dem_clip = float(prev_eff)
 
-    if quiet_available and (temp_override is None):
-        allow_real_100 = False
-        if want_full and (err > LAST_RESORT_MIN_ERR_C) and (not defrosting):
-            if _last_resort_since[unit_name] <= 0.0:
-                _last_resort_since[unit_name] = now
-            elapsed = now - _last_resort_since[unit_name]
-            if err >= LAST_RESORT_ERR_C:
-                allow_real_100 = True
-            elif elapsed >= (LAST_RESORT_MINUTES * 60.0):
-                allow_real_100 = True
-        else:
-            _last_resort_since[unit_name] = 0.0
+    if quiet_available and allow_real_100 and (dem_clip >= LEARNED_SHOW_105_THRESHOLD) and (band_upper >= 100.0):
+        dem_target_virtual = 105.0
     else:
-        _last_resort_since[unit_name] = 0.0
+        dem_target_virtual = float(_snap_to_valid_demand(dem_clip, quiet_available=False))
 
     cap_limited = (dem_clip >= (float(band_upper) - 1e-9))
     snap_dir = -1 if cap_limited else 0
 
     if quiet_available:
-        option = _apply_demand_with_quiet(unit_name, SELECT, QUIET_SWITCH, dem_clip, prev_str, allow_real_100, direction=snap_dir)
+        option = _apply_demand_with_quiet(unit_name, SELECT, QUIET_SWITCH, dem_target_virtual, prev_str, allow_real_100, direction=snap_dir)
     else:
-        option = _apply_demand(unit_name, SELECT, dem_clip, prev_str, direction=snap_dir)
+        option = _apply_demand(unit_name, SELECT, dem_target_virtual, prev_str, direction=snap_dir)
 
     if option and option != prev_str:
         _last_demand_change_ts[unit_name] = now
 
     log.info(
-        "Daikin ML (%s): ctx=%s Tin=%.2f Tout=%.2f Tout_f=%.2f hum=%s wind=%s wcf=%.3f sev=%.3f(vol=%.3f std=%s) avg_h=%s(step=%.2f) "
-        "risk=%.3f frost=%.3f sp=%.2f target=%.2f base=%.2f d=%.3f err=%.2f | fireplace=%s steady=%s freeze=%s | conf=%.3f blend=%.3f step_scale=%.2f upd=%s | "
-        "cap_base=%.1f cap_dyn=%.1f band_upper=%.1f def_pred=%s | power=%sW comp=%sHz w/degC/h=%s | dem_opt=%.1f -> dem_clip=%.1f -> %s",
-        unit_name, ctx, Tin, Tout_raw, float(Tout_future),
-        str(humidity_pct), str(wind_speed), float(wind_cold_factor),
-        float(nordpool_sev), float(vol_norm), (str(round(vol_std, 4)) if isfinite(vol_std) else "None"),
-        str(nordpool_avg_window_h), float(NORDPOOL_AVG_WINDOW_STEP_H),
-        float(risk), float(frost_int),
-        float(sp), float(sp_target), float(base_sp), float(sp_delta), err,
-        str(fireplace_on), str(steady_ok), str(frozen_ctx),
-        float(confidence), float(blend_factor), float(step_scale), str(upd_count),
-        float(icing_cap_base), float(icing_cap_dynamic), float(band_upper), str(defrost_predicted),
-        (str(round(power_w, 1)) if power_w is not None and isfinite(power_w) else "None"),
-        (str(round(comp_hz, 2)) if comp_hz is not None and isfinite(comp_hz) else "None"),
-        (str(round(w_per_dth, 2)) if w_per_dth is not None and isfinite(w_per_dth) else "None"),
-        float(dem_opt), float(dem_clip), str(option),
+        "Daikin ML (%s): ctx=%s Tin=%.2f Tout=%.2f sp=%.2f sp_changed=%s err=%.2f | "
+        "freeze_active=%s bypass_sp=%s remain_s=%.0f | learned=%s allow_real_100=%s | apply=%s -> %s",
+        unit_name, ctx, Tin, Tout_raw, float(sp), str(setpoint_changed_any_reason), float(err),
+        str(freeze_active), str(freeze_bypassed_by_setpoint), float(freeze_remaining_s),
+        str(learned_disp), str(allow_real_100), str(dem_target_virtual), str(option),
     )
 
 # ============================================================
