@@ -634,6 +634,21 @@ _INDOOR_TRIGGERS = [x for x in _INDOOR_TRIGGERS if not (x in _seen or _seen.add(
 
 _INDOOR_TRIGGER_EXPR = " or ".join(_INDOOR_TRIGGERS) if _INDOOR_TRIGGERS else None
 
+# ------------------------------------------------------------
+# FIX (multi-unit cross-talk):
+# identify which INDOOR entity triggered this run (if state_trigger)
+# ------------------------------------------------------------
+def _get_trigger_entity_from_kwargs(kwargs):
+    """
+    Pyscript versions differ; try common keys and return an entity_id like 'sensor.xxx'.
+    If not found, return None (e.g., cron run).
+    """
+    for k in ("entity_id", "var_name", "trigger_entity", "trigger_var", "trigger"):
+        v = kwargs.get(k)
+        if isinstance(v, str) and "." in v:
+            return v
+    return None
+
 @time_trigger("startup")
 def _ml_startup_ok():
     for u in DAIKINS:
@@ -679,7 +694,22 @@ if _INDOOR_TRIGGER_EXPR:
             except Exception:
                 pass
 
+        # ------------------------------------------------------------
+        # FIX: if triggered by one unit's INDOOR sensor change,
+        # run only that unit (prevents affecting other unit's quiet switch).
+        # Cron runs still sweep all units.
+        # ------------------------------------------------------------
+        trig_ent = _get_trigger_entity_from_kwargs(kwargs)
+        run_only_unit = None
+        if trig_ent:
+            for uu in DAIKINS:
+                if uu.get("INDOOR") == trig_ent:
+                    run_only_unit = uu.get("name")
+                    break
+
         for u in DAIKINS:
+            if run_only_unit and u.get("name") != run_only_unit:
+                continue
             try:
                 _run_one_unit(u)
             except Exception as e:
