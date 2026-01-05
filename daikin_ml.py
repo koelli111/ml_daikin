@@ -65,6 +65,7 @@ DAIKINS = [
     #     "WEATHER": "weather.koti",
     #     "SELECT": "select.toinen_daikin_demand_control",
     #     "LIQUID": "sensor.toinen_daikin_liquid",
+    #     "QUIET_OUTDOOR_SWITCH": "switch.toinen_daikin_quiet_outdoor",
     #     "SP_HELPER": "input_number.daikin2_setpoint",
     #     "STEP_LIMIT_HELPER": "input_number.daikin2_step_limit",
     #     "DEADBAND_HELPER": "input_number.daikin2_deadband",
@@ -124,6 +125,13 @@ SOFT_APPROACH_EPS = 0.01  # °C: require this much progress toward setpoint to c
 # ------------------------------------------------------------
 EFF_TRIM_STEP = 2.0         # demand-% per tick inside deadband
 EFF_TRIM_STEP_FAST = 5.0    # demand-% per tick when above setpoint (err < 0)
+
+# ------------------------------------------------------------
+# NEW: Demand change minimum interval (per unit)
+# After any applied demand change (select or quiet switch), wait at least 60s
+# before allowing the next demand change for that unit.
+# ------------------------------------------------------------
+DEMAND_CHANGE_MIN_INTERVAL_S = 60.0
 
 # ============================================================
 # Nordpool -> Setpoint integration
@@ -510,7 +518,6 @@ def _update_nordpool_avg_window_hours(outdoor_entity):
             pass
 
 
-
 # ============================================================
 # 4) PER-LAITE TILA (THETA/P + DEFROST-COOLDOWN)
 # ============================================================
@@ -523,6 +530,10 @@ _cooldown_until    = {}   # unit -> epoch float
 
 # Track previous control error per unit (for soft-landing approach detection)
 _prev_err          = {}   # unit -> last err (float)
+
+# NEW: per-unit demand change rate limit
+_last_demand_change_ts = {}   # unit -> epoch float
+_last_demand_sig       = {}   # unit -> tuple signature of last applied state (select, quiet_state)
 
 
 def _persist_all_stores():
@@ -545,6 +556,10 @@ def _init_unit_if_needed(unit_name):
         _cooldown_until[unit_name] = 0.0
     if unit_name not in _prev_err:
         _prev_err[unit_name] = None
+    if unit_name not in _last_demand_change_ts:
+        _last_demand_change_ts[unit_name] = 0.0
+    if unit_name not in _last_demand_sig:
+        _last_demand_sig[unit_name] = None
 
 def _load_params_from_store(unit):
     unit_name = unit["name"]
@@ -1193,39 +1208,85 @@ def _run_one_unit(u):
 
     desired_option = _snap_to_select(SELECT, desired_base, 0)
 
-    # Set select option if needed
-    if desired_option and desired_option != prev_str:
-        select.select_option(entity_id=SELECT, option=desired_option)
-
     # Quiet outdoor switching only matters at max demand layer.
     if QUIET_SW and desired_base >= 100.0 - 1e-6:
-        # NEW FIX: When stable/above setpoint, always keep quiet ON at 100.
+        # When stable/above setpoint, always keep quiet ON at 100.
         if stable_or_above:
             want_quiet_on = True
         else:
             want_quiet_on = (desired_layer <= 100.0 + 1e-6)
+    else:
+        want_quiet_on = None  # not relevant in this regime
 
-        if want_quiet_on and (quiet_on is False):
-            try:
-                switch.turn_on(entity_id=QUIET_SW)
-                quiet_on = True
-            except Exception:
-                pass
-        elif (not want_quiet_on) and (quiet_on is True):
-            try:
-                switch.turn_off(entity_id=QUIET_SW)
-                quiet_on = False
-            except Exception:
-                pass
-    elif QUIET_SW and desired_base < 100.0 - 1e-6:
-        # If we were previously in the extra layer (quiet OFF) and we drop below 100,
-        # restore quiet ON (safe default).
-        if prev >= 100.0 - 1e-6 and (quiet_on is False):
-            try:
-                switch.turn_on(entity_id=QUIET_SW)
-                quiet_on = True
-            except Exception:
-                pass
+    # ------------------------------------------------------------
+    # NEW: Per-unit demand change minimum interval (60s)
+    # Only blocks *changes*; caps earlier in the function still apply immediately.
+    # A "change" is either:
+    #  - select option changes OR
+    #  - quiet outdoor switch changes (when relevant)
+    # ------------------------------------------------------------
+    current_sig = (prev_str, quiet_on)
+    desired_sig = (desired_option, quiet_on)
+    if QUIET_SW:
+        # If we're at >=100 base, quiet state is meaningful; below 100 we keep "as is" unless restoring safe ON.
+        if desired_base >= 100.0 - 1e-6:
+            desired_sig = (desired_option, want_quiet_on)
+        else:
+            # below 100: we will restore quiet ON if we were previously in extra layer (quiet OFF) and dropping below 100
+            if prev >= 100.0 - 1e-6 and (quiet_on is False):
+                desired_sig = (desired_option, True)
+            else:
+                desired_sig = (desired_option, quiet_on)
+
+    change_needed = (desired_sig != current_sig)
+
+    if change_needed:
+        last_ts = float(_last_demand_change_ts.get(unit_name, 0.0) or 0.0)
+        age = now - last_ts
+        if age < DEMAND_CHANGE_MIN_INTERVAL_S:
+            # Rate-limited: do NOT apply any change this tick
+            log.info(
+                "Daikin ML (%s): demand change rate-limited (%.0fs < %.0fs). Keeping current: select=%s quiet=%s, desired: select=%s quiet=%s",
+                unit_name, age, DEMAND_CHANGE_MIN_INTERVAL_S,
+                str(prev_str), str(quiet_on),
+                str(desired_sig[0]), str(desired_sig[1]),
+            )
+            _prev_err[unit_name] = err
+            return
+
+    # Set select option if needed
+    if desired_option and desired_option != prev_str:
+        select.select_option(entity_id=SELECT, option=desired_option)
+
+    if QUIET_SW:
+        if desired_base >= 100.0 - 1e-6:
+            # apply quiet switch only if different
+            if want_quiet_on is True and (quiet_on is False):
+                try:
+                    switch.turn_on(entity_id=QUIET_SW)
+                    quiet_on = True
+                except Exception:
+                    pass
+            elif want_quiet_on is False and (quiet_on is True):
+                try:
+                    switch.turn_off(entity_id=QUIET_SW)
+                    quiet_on = False
+                except Exception:
+                    pass
+        elif desired_base < 100.0 - 1e-6:
+            # If we were previously in the extra layer (quiet OFF) and we drop below 100,
+            # restore quiet ON (safe default).
+            if prev >= 100.0 - 1e-6 and (quiet_on is False):
+                try:
+                    switch.turn_on(entity_id=QUIET_SW)
+                    quiet_on = True
+                except Exception:
+                    pass
+
+    # If we got here and a change was needed, we applied it (best-effort) -> stamp rate limiter
+    if change_needed:
+        _last_demand_change_ts[unit_name] = now
+        _last_demand_sig[unit_name] = desired_sig
 
     # Update previous error for soft-landing detection next tick
     _prev_err[unit_name] = err
@@ -1270,6 +1331,10 @@ def daikin_ml_reset():
         _params_loaded[unit_name] = False
         _last_defrosting[unit_name] = None
         _cooldown_until[unit_name] = 0.0
+
+        # also reset rate limiter for this unit
+        _last_demand_change_ts[unit_name] = 0.0
+        _last_demand_sig[unit_name] = None
 
         try:
             state.set(
