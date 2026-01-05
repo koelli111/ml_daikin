@@ -11,7 +11,7 @@ DAIKINS = [
     {
         "name": "daikin1",
 
-        "INDOOR": "sensor.apollo_round",
+        "INDOOR": "sensor.apollo_temp_1_96a244_board_temperature",
         "INDOOR_RATE": "sensor.apollo_temp_1_derivative",
         "OUTDOOR": "sensor.iv_tulo_lampotila",
         "WEATHER": "weather.koti",
@@ -27,8 +27,6 @@ DAIKINS = [
         "DEADBAND_HELPER": "input_number.daikin_deadband",
         "ICING_CAP_HELPER": "input_number.daikin_icing_cap",
 
-
-
         # Manual base setpoint (user controls this)
         "SP_BASE_HELPER": "input_number.daikin_setpoint_base",
 
@@ -41,11 +39,21 @@ DAIKINS = [
         # Low/high setpoint guards (per unit)
         "MIN_TEMP_GUARD_HELPER": "input_number.daikin1_min_temp_guard",
         "MAX_TEMP_GUARD_HELPER": "input_number.daikin1_max_temp_guard",
+
         # Persistent store per laite (suositus: eri entity per daikin)
         "STORE_ENTITY": "pyscript.daikin1_ml_params",
 
         # Learned-demand sensori per laite
         "LEARNED_SENSOR": "sensor.daikin1_ml_learned_demand",
+
+        # ------------------------------------------------------------
+        # Minimum demand floors by outdoor temperature band
+        # (Hard floor enforced regardless of setpoint vs indoor temp)
+        # Bands are in whole-degree buckets (int(round(Tout_raw))).
+        # ------------------------------------------------------------
+        "MIN_DEM_FLOOR_M05_M10": "input_number.daikin1_min_dem_m05_m10",  # -5 .. -10
+        "MIN_DEM_FLOOR_M11_M15": "input_number.daikin1_min_dem_m11_m15",  # -11 .. -15
+        "MIN_DEM_FLOOR_LE_M16":  "input_number.daikin1_min_dem_le_m16",   # <= -16
     },
 
     # Esimerkki toisesta laitteesta (muuta entityt):
@@ -63,6 +71,10 @@ DAIKINS = [
     #     "ICING_CAP_HELPER": "input_number.daikin2_icing_cap",
     #     "STORE_ENTITY": "pyscript.daikin2_ml_params",
     #     "LEARNED_SENSOR": "sensor.daikin2_ml_learned_demand",
+    #
+    #     "MIN_DEM_FLOOR_M05_M10": "input_number.daikin2_min_dem_m05_m10",
+    #     "MIN_DEM_FLOOR_M11_M15": "input_number.daikin2_min_dem_m11_m15",
+    #     "MIN_DEM_FLOOR_LE_M16":  "input_number.daikin2_min_dem_le_m16",
     # },
 ]
 
@@ -102,12 +114,16 @@ AUTO_DB_BASE   = 0.10
 # Soft landing near setpoint: when indoor temperature approaches setpoint,
 # slow down demand changes to avoid harsh overshoot/oscillation.
 SOFT_ERR_START = 0.2   # °C: start softening when |err| <= this AND moving toward setpoint
-SOFT_ERR_END   = 0.0  # °C: strongest softening when |err| <= this
+SOFT_ERR_END   = 0.0   # °C: strongest softening when |err| <= this
 SOFT_STEP_MIN  = 1.0   # %: minimum step change allowed near setpoint
 SOFT_APPROACH_EPS = 0.01  # °C: require this much progress toward setpoint to count as 'approaching'
 
-
-
+# ------------------------------------------------------------
+# Efficiency behavior inside deadband
+# Trim down demand while inside ±deadband to find lowest sustaining demand.
+# ------------------------------------------------------------
+EFF_TRIM_STEP = 2.0         # demand-% per tick inside deadband
+EFF_TRIM_STEP_FAST = 5.0    # demand-% per tick when above setpoint (err < 0)
 
 # ============================================================
 # Nordpool -> Setpoint integration
@@ -118,8 +134,8 @@ SP_BASE_DEFAULT = 22.5
 SP_BIAS_DEGC_PER_POINT = 0.05
 
 # Clamp applied setpoint shift (°C)
-SP_BIAS_CLAMP_MIN = -1.5
-SP_BIAS_CLAMP_MAX = +1.5
+SP_BIAS_CLAMP_MIN = -0.5
+SP_BIAS_CLAMP_MAX = +0.5
 
 # Defaults for guards if helpers missing/unset
 MIN_GUARD_DEFAULT = 16.0
@@ -139,9 +155,9 @@ AVG_WINDOW_FACTOR_MAX = 2.0
 WEATHER_FORECAST_HOURLY_SENSOR = "sensor.weather_forecast_hourly"
 
 # Dynamic mapping: colder -> shorter Nordpool averaging window (hours)
-AVG_WINDOW_MIN_H = 3.0
-AVG_WINDOW_MAX_H = 24.0
-AVG_WINDOW_TEMP_COLD = -20.0   # at / below this => AVG_WINDOW_MIN_H
+AVG_WINDOW_MIN_H = 1.0
+AVG_WINDOW_MAX_H = 4.0
+AVG_WINDOW_TEMP_COLD = -10.0   # at / below this => AVG_WINDOW_MIN_H
 AVG_WINDOW_TEMP_WARM = 5.0     # at / above this => AVG_WINDOW_MAX_H
 AVG_WINDOW_WRITE_EPS = 0.1     # don't spam helper writes
 
@@ -367,6 +383,45 @@ def _avg_future_outdoor(weather_entity, outdoor_entity):
         return v if isfinite(v) else 0.0
     except Exception:
         return 0.0
+
+# ------------------------------------------------------------
+# Read float helper + enforce min-demand floors by outdoor band
+# ------------------------------------------------------------
+def _read_float_entity(entity_id, default):
+    try:
+        v = float(state.get(entity_id))
+        return v if isfinite(v) else default
+    except Exception:
+        return default
+
+def _min_demand_floor_for_outdoor(u, Tout_bucket):
+    """
+    Returns the enforced minimum demand floor based on outdoor temperature bucket.
+
+    Bands (in whole-degree buckets, using int(round(Tout_raw))):
+      -10..-5   -> MIN_DEM_FLOOR_M05_M10
+      -15..-11  -> MIN_DEM_FLOOR_M11_M15
+      <= -16    -> MIN_DEM_FLOOR_LE_M16
+    """
+    floor = MIN_DEM
+
+    ent_05_10 = u.get("MIN_DEM_FLOOR_M05_M10")
+    ent_11_15 = u.get("MIN_DEM_FLOOR_M11_M15")
+    ent_le_16 = u.get("MIN_DEM_FLOOR_LE_M16")
+
+    if -10 <= Tout_bucket <= -5 and ent_05_10:
+        floor = _read_float_entity(ent_05_10, floor)
+    elif -15 <= Tout_bucket <= -11 and ent_11_15:
+        floor = _read_float_entity(ent_11_15, floor)
+    elif Tout_bucket <= -16 and ent_le_16:
+        floor = _read_float_entity(ent_le_16, floor)
+
+    # sanity
+    floor = _clip(floor, 0.0, 100.0)
+    # never below global MIN_DEM
+    floor = max(MIN_DEM, floor)
+    return floor
+
 
 # ============================================================
 # Nordpool avg window dynamic update (based on hourly forecast)
@@ -736,8 +791,7 @@ def _run_one_unit(u):
     else:
         bias_points = 0.0
 
-    # 4) Convert bias points -> °C shift and clamp
-        # 4) Read dynamic averaging window hours and convert to a scaling factor
+    # 4) Read dynamic averaging window hours and convert to a scaling factor
     try:
         avg_window_h = float(state.get(NORDPOOL_AVG_WINDOW_HELPER) or AVG_WINDOW_REF_H)
     except Exception:
@@ -835,6 +889,9 @@ def _run_one_unit(u):
     Tout_bucket = int(round(Tout_raw))
     ctx = _context_key_for_outdoor(Tout_raw)
 
+    # Minimum demand floor for this outdoor band (hard constraint)
+    min_floor = _min_demand_floor_for_outdoor(u, Tout_bucket)
+
     if ctx not in _theta_by_unit_ctx[unit_name]:
         _theta_by_unit_ctx[unit_name][ctx] = [0.0, 0.0, 5.0, 0.0]
     if ctx not in _P_by_unit_ctx[unit_name]:
@@ -877,6 +934,12 @@ def _run_one_unit(u):
 
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
     band_upper = min(global_upper, icing_cap) if in_icing_band else global_upper
+
+    # If min_floor is higher than computed band_upper, lift the band_upper:
+    # you requested minimum floor to be followed regardless.
+    if min_floor > band_upper:
+        band_upper = min_floor
+
     band_upper_layer = band_upper if band_upper < 100.0 else unit_max_dem
 
     # jos edellinen yli band_upper, tiputetaan heti
@@ -1004,20 +1067,30 @@ def _run_one_unit(u):
             rate=round(rate, 4),
             quiet_outdoor=quiet_state,
             demand_layer_max=(unit_max_dem if (unit_has_quiet and band_upper >= 100.0) else band_upper),
+            min_floor=round(float(min_floor), 1),
         )
     except Exception as e:
         log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
 
-    # Deadband: pidä ennallaan
+    # Deadband / efficiency:
+    # Trim down while inside deadband, but never below min_floor.
     if abs(err) <= deadband:
-        dem_target = prev_eff
+        trim = EFF_TRIM_STEP_FAST if err < 0 else EFF_TRIM_STEP
+        if trim > step_limit:
+            trim = step_limit
+        dem_target = max(min_floor, prev_eff - trim)
     else:
         dem_target = dem_opt
+
+    # FIX: Don't "stick" in the 105% layer.
+    # 105 is implemented as select=100 + quiet_outdoor OFF.
+    # If stable (inside deadband) or above setpoint, force back to 100.
+    if unit_has_quiet and prev_eff > 100.0 and (abs(err) <= deadband or err <= 0.0):
+        dem_target = min(dem_target, 100.0)
 
     # Monotoninen ehto: jos ollaan kylmällä puolella, demand ei saa laskea
     if err > deadband and dem_target < prev_eff:
         dem_target = prev_eff
-
 
     # Soft landing: only when we're within SOFT_ERR_START and actually moving toward setpoint
     abs_err = abs(err)
@@ -1030,7 +1103,6 @@ def _run_one_unit(u):
         # Approaching from ABOVE: err stays negative and increases toward 0
         elif err < 0 and prev_err < 0 and (err > (prev_err + SOFT_APPROACH_EPS)):
             approaching = True
-
 
     if approaching and abs_err <= SOFT_ERR_START:
         # 1.0 at edge of soften band -> minimal softening, 0.0 very close -> strongest softening
@@ -1058,7 +1130,17 @@ def _run_one_unit(u):
         if -delta > down_limit:
             dem_target = prev_eff - down_limit
 
-    dem_clip = _clip(dem_target, MIN_DEM, band_upper_layer)
+    # Final clamp now respects the outdoor-band minimum floor
+    dem_clip = _clip(dem_target, min_floor, band_upper_layer)
+
+    # ------------------------------------------------------------
+    # NEW FIX: When stable (inside deadband) OR above setpoint, never allow the 105-layer.
+    # Force dem_clip to exactly 100 so we don't end up with select=100 + quiet_outdoor OFF.
+    # ------------------------------------------------------------
+    stable_or_above = (abs(err) <= deadband) or (err <= 0.0)
+    if unit_has_quiet and stable_or_above and dem_clip >= 100.0 - 1e-6:
+        dem_clip = 100.0
+
     option = _snap_to_select(SELECT, dem_clip, 0)
 
     try:
@@ -1087,7 +1169,12 @@ def _run_one_unit(u):
 
     # Quiet outdoor switching only matters at max demand layer.
     if QUIET_SW and desired_base >= 100.0 - 1e-6:
-        want_quiet_on = (desired_layer <= 100.0 + 1e-6)
+        # NEW FIX: When stable/above setpoint, always keep quiet ON at 100.
+        if stable_or_above:
+            want_quiet_on = True
+        else:
+            want_quiet_on = (desired_layer <= 100.0 + 1e-6)
+
         if want_quiet_on and (quiet_on is False):
             try:
                 switch.turn_on(entity_id=QUIET_SW)
@@ -1119,12 +1206,12 @@ def _run_one_unit(u):
     log.info(
         "Daikin ML (%s): ctx=%s | Tin=%.2f°C, Tout=%.2f°C (bucket=%d, →%.1f°C), "
         "DEFROST=%s, cooldown=%s, rate_bad=%s, "
-        "icing_band=%s, band_upper=%.0f%%, theta=%s | "
+        "icing_band=%s, band_upper=%.0f%%, min_floor=%.0f%%, theta=%s | "
         "SP=%.2f, step_limit=%.1f, deadband=%.2f | "
         "prev=%s → opt≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s",
         unit_name, ctx, Tin, Tout_raw, Tout_bucket, Tout_future,
         str(defrosting), cool_str, str(rate_bad),
-        icing_str, band_upper, theta_str,
+        icing_str, band_upper, min_floor, theta_str,
         sp, step_limit, deadband,
         prev_str, dem_opt, dem_target, dem_clip, option,
     )
