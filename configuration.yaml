@@ -137,6 +137,30 @@ input_number:
     mode: box
     unit_of_measurement: "°C"
 
+  daikin1_min_dem_m05_m10:
+    name: "Daikin1 min demand (-5…-10°C)"
+    min: 0
+    max: 100
+    step: 1
+    mode: slider
+    unit_of_measurement: "%"
+
+  daikin1_min_dem_m11_m15:
+    name: "Daikin1 min demand (-11…-15°C)"
+    min: 0
+    max: 100
+    step: 1
+    mode: slider
+    unit_of_measurement: "%"
+
+  daikin1_min_dem_le_m16:
+    name: "Daikin1 min demand (≤ -16°C)"
+    min: 0
+    max: 100
+    step: 1
+    mode: slider
+    unit_of_measurement: "%"
+
 template:
 
   - sensor:
