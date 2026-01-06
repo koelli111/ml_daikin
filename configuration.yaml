@@ -161,6 +161,45 @@ input_number:
     mode: slider
     unit_of_measurement: "%"
 
+  # ------------------------------------------------------------
+  # Daikin1: TEMP-BASED MAX DEMAND CAPS (hard caps)
+  # -5 .. -10
+  daikin1_max_dem_m05_m10:
+    name: "Daikin1 max demand (-5…-10°C)"
+    min: 30
+    max: 100
+    step: 1
+    mode: slider
+    unit_of_measurement: "%"
+
+  # -11 .. -15
+  daikin1_max_dem_m11_m15:
+    name: "Daikin1 max demand (-11…-15°C)"
+    min: 30
+    max: 100
+    step: 1
+    mode: slider
+    unit_of_measurement: "%"
+
+  # <= -16
+  daikin1_max_dem_le_m16:
+    name: "Daikin1 max demand (≤ -16°C)"
+    min: 30
+    max: 100
+    step: 1
+    mode: slider
+    unit_of_measurement: "%"
+
+  daikin1_demand_change_min_interval_s:
+    name: "Daikin1 demand change min interval (s)"
+    icon: mdi:timer-sand
+    min: 0
+    max: 600
+    step: 5
+    mode: slider
+    unit_of_measurement: "s"
+    initial: 60
+
 template:
 
   - sensor:
