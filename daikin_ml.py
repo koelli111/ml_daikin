@@ -1,13 +1,5 @@
 # pyscript/daikin_ml_multi.py
 # Online-RLS (oppiva) ohjain Daikin demand-selectille, MULTI-DAIKIN -tuella.
-# FIXES:
-# - NaN/inf-suojaukset: rate / x / y / theta / dem_opt ei voi enää korruptoitua tai mennä NaN:ksi
-# - _clip on NaN-safe
-# - _rls_update on NaN-safe (hylkää päivityksen jos jokin menee epäkelvoksi)
-# - tallennus/lataus ohittaa epäkelvot (NaN/inf) theta-arvot
-# - learned demand sensor ei koskaan saa NaN:ia (fallback prev_eff)
-#
-# MUOKKAA: DAIKINS-listaan omat entityt (yksi dict per Daikin)
 
 import time
 from math import isfinite
@@ -19,24 +11,62 @@ DAIKINS = [
     {
         "name": "daikin1",
 
-        "INDOOR": "sensor.living_room_lampotila",
-        "INDOOR_RATE": "sensor.sisalampotila_aula",
+        "INDOOR": "sensor.apollo_temp_1_96a244_board_temperature",
+        "INDOOR_RATE": "sensor.apollo_temp_1_derivative",
         "OUTDOOR": "sensor.iv_tulo_lampotila",
         "WEATHER": "weather.koti",
 
         "SELECT": "select.faikin_demand_control",
         "LIQUID": "sensor.faikin_liquid",
 
+        # Quiet outdoor mode switch (Faikin)
+        "QUIET_OUTDOOR_SWITCH": "switch.faikin_quiet_outdoor",
+
         "SP_HELPER": "input_number.daikin_setpoint",
         "STEP_LIMIT_HELPER": "input_number.daikin_step_limit",
         "DEADBAND_HELPER": "input_number.daikin_deadband",
         "ICING_CAP_HELPER": "input_number.daikin_icing_cap",
+
+        # Manual base setpoint (user controls this)
+        "SP_BASE_HELPER": "input_number.daikin_setpoint_base",
+
+        # Nordpool bias points (written by nordpool_15m_bias.py)
+        "PRICE_BIAS_HELPER": "input_number.daikin1_price_bias_points",
+
+        # Nordpool bias enable/disable
+        "PRICE_BIAS_ENABLED": "input_boolean.nordpool_bias_enabled",
+
+        # Low/high setpoint guards (per unit)
+        "MIN_TEMP_GUARD_HELPER": "input_number.daikin1_min_temp_guard",
+        "MAX_TEMP_GUARD_HELPER": "input_number.daikin1_max_temp_guard",
 
         # Persistent store per laite (suositus: eri entity per daikin)
         "STORE_ENTITY": "pyscript.daikin1_ml_params",
 
         # Learned-demand sensori per laite
         "LEARNED_SENSOR": "sensor.daikin1_ml_learned_demand",
+
+        # ------------------------------------------------------------
+        # Minimum demand floors by outdoor temperature band
+        # (Hard floor enforced regardless of setpoint vs indoor temp)
+        # Bands are in whole-degree buckets (int(round(Tout_raw))).
+        # ------------------------------------------------------------
+        "MIN_DEM_FLOOR_M05_M10": "input_number.daikin1_min_dem_m05_m10",  # -5 .. -10
+        "MIN_DEM_FLOOR_M11_M15": "input_number.daikin1_min_dem_m11_m15",  # -11 .. -15
+        "MIN_DEM_FLOOR_LE_M16":  "input_number.daikin1_min_dem_le_m16",   # <= -16
+
+        # ------------------------------------------------------------
+        # NEW: Maximum demand caps by outdoor temperature band
+        # (Hard cap enforced regardless of setpoint vs indoor temp)
+        # ------------------------------------------------------------
+        "MAX_DEM_CAP_M05_M10": "input_number.daikin1_max_dem_m05_m10",  # -5 .. -10
+        "MAX_DEM_CAP_M11_M15": "input_number.daikin1_max_dem_m11_m15",  # -11 .. -15
+        "MAX_DEM_CAP_LE_M16":  "input_number.daikin1_max_dem_le_m16",   # <= -16
+
+        # ------------------------------------------------------------
+        # NEW: Per-unit minimum interval between *applied* demand changes (seconds)
+        # ------------------------------------------------------------
+        "DEMAND_CHANGE_MIN_INTERVAL_HELPER": "input_number.daikin1_demand_change_min_interval_s",
     },
 
     # Esimerkki toisesta laitteesta (muuta entityt):
@@ -48,12 +78,28 @@ DAIKINS = [
     #     "WEATHER": "weather.koti",
     #     "SELECT": "select.toinen_daikin_demand_control",
     #     "LIQUID": "sensor.toinen_daikin_liquid",
+    #     "QUIET_OUTDOOR_SWITCH": "switch.toinen_daikin_quiet_outdoor",
     #     "SP_HELPER": "input_number.daikin2_setpoint",
     #     "STEP_LIMIT_HELPER": "input_number.daikin2_step_limit",
     #     "DEADBAND_HELPER": "input_number.daikin2_deadband",
     #     "ICING_CAP_HELPER": "input_number.daikin2_icing_cap",
+    #     "SP_BASE_HELPER": "input_number.daikin2_setpoint_base",
+    #     "PRICE_BIAS_HELPER": "input_number.daikin2_price_bias_points",
+    #     "PRICE_BIAS_ENABLED": "input_boolean.nordpool_bias_enabled",
+    #     "MIN_TEMP_GUARD_HELPER": "input_number.daikin2_min_temp_guard",
+    #     "MAX_TEMP_GUARD_HELPER": "input_number.daikin2_max_temp_guard",
     #     "STORE_ENTITY": "pyscript.daikin2_ml_params",
     #     "LEARNED_SENSOR": "sensor.daikin2_ml_learned_demand",
+    #
+    #     "MIN_DEM_FLOOR_M05_M10": "input_number.daikin2_min_dem_m05_m10",
+    #     "MIN_DEM_FLOOR_M11_M15": "input_number.daikin2_min_dem_m11_m15",
+    #     "MIN_DEM_FLOOR_LE_M16":  "input_number.daikin2_min_dem_le_m16",
+    #
+    #     "MAX_DEM_CAP_M05_M10": "input_number.daikin2_max_dem_m05_m10",
+    #     "MAX_DEM_CAP_M11_M15": "input_number.daikin2_max_dem_m11_m15",
+    #     "MAX_DEM_CAP_LE_M16":  "input_number.daikin2_max_dem_le_m16",
+    #
+    #     "DEMAND_CHANGE_MIN_INTERVAL_HELPER": "input_number.daikin2_demand_change_min_interval_s",
     # },
 ]
 
@@ -66,6 +112,12 @@ LAMBDA     = 0.995
 P0         = 1e4
 MIN_DEM    = 30.0
 MAX_DEM    = 100.0
+
+# Extra "layer" for max demand using quiet outdoor switch:
+#  - Demand 100 with quiet_outdoor ON  => effective demand 100
+#  - Demand 100 with quiet_outdoor OFF => effective demand 105
+MAX_DEM_LAYER = 105.0
+QUIET_LAYER_EXTRA = 5.0
 KAPPA      = 1.0
 
 GLOBAL_MILD_MAX = 95.0
@@ -84,6 +136,80 @@ AUTO_STEP_BASE = 10.0
 AUTO_DB_MIN    = 0.05
 AUTO_DB_MAX    = 0.50
 AUTO_DB_BASE   = 0.10
+
+# Soft landing near setpoint: when indoor temperature approaches setpoint,
+# slow down demand changes to avoid harsh overshoot/oscillation.
+SOFT_ERR_START = 0.2   # °C: start softening when |err| <= this AND moving toward setpoint
+SOFT_ERR_END   = 0.0   # °C: strongest softening when |err| <= this
+SOFT_STEP_MIN  = 1.0   # %: minimum step change allowed near setpoint
+SOFT_APPROACH_EPS = 0.01  # °C: require this much progress toward setpoint to count as 'approaching'
+
+# ------------------------------------------------------------
+# Efficiency behavior inside deadband
+# Trim down demand while inside ±deadband to find lowest sustaining demand.
+# ------------------------------------------------------------
+EFF_TRIM_STEP = 2.0         # demand-% per tick inside deadband
+EFF_TRIM_STEP_FAST = 5.0    # demand-% per tick when above setpoint (err < 0)
+
+# ------------------------------------------------------------
+# NEW: Default minimum interval between applied demand changes (seconds)
+# This is overridden per-unit by DEMAND_CHANGE_MIN_INTERVAL_HELPER if present.
+# ------------------------------------------------------------
+DEMAND_CHANGE_MIN_INTERVAL_DEFAULT_S = 60.0
+
+# ------------------------------------------------------------
+# NEW: Learning uses smoothed 5-minute slope of indoor temperature
+# - Keeps a per-unit history of (timestamp, Tin)
+# - If not enough history/span, falls back to the derivative sensor
+# ------------------------------------------------------------
+TIN_SLOPE_WINDOW_S = 5 * 60.0
+TIN_SLOPE_MIN_SPAN_S = 4 * 60.0  # require at least ~4 minutes span for "true 5-minute" slope
+TIN_SLOPE_MIN_SAMPLES = 3        # require a few points for smoothing/robustness
+
+# ------------------------------------------------------------
+# Defrost hold behavior
+# - Freeze to pre-defrost demand during defrost
+# - Keep same demand for 5 minutes after defrost ends
+# - Do not collect/use Tin measurements until hold period ends
+# ------------------------------------------------------------
+DEFROST_LIQUID_THRESHOLD = 20.0
+POST_DEFROST_HOLD_S = 5 * 60.0
+
+# ============================================================
+# Nordpool -> Setpoint integration
+# ============================================================
+SP_BASE_DEFAULT = 22.5
+
+# Convert "bias points" (typically -20..+20) into °C setpoint shift.
+SP_BIAS_DEGC_PER_POINT = 0.05
+
+# Clamp applied setpoint shift (°C)
+SP_BIAS_CLAMP_MIN = -0.5
+SP_BIAS_CLAMP_MAX = +0.5
+
+# Defaults for guards if helpers missing/unset
+MIN_GUARD_DEFAULT = 16.0
+MAX_GUARD_DEFAULT = 28.0
+
+# Don’t spam writes for tiny changes
+SP_WRITE_EPS = 0.01
+
+# Nordpool avg window hours (dynamic) -> bias strength scaling
+NORDPOOL_AVG_WINDOW_HELPER = "input_number.nordpool_avg_window_hours"
+# Reference window used for scaling. Shorter window => stronger bias, longer => weaker.
+AVG_WINDOW_REF_H = 12.0
+AVG_WINDOW_FACTOR_MIN = 0.5
+AVG_WINDOW_FACTOR_MAX = 2.0
+
+# Hourly outdoor forecast sensor (attributes: forecast: [{temperature: ...}, ...])
+WEATHER_FORECAST_HOURLY_SENSOR = "sensor.weather_forecast_hourly"
+
+# Dynamic mapping: colder -> shorter Nordpool averaging window (hours)
+AVG_WINDOW_MIN_H = 1.0
+AVG_WINDOW_MAX_H = 4.0
+AVG_WINDOW_TEMP_COLD = -10.0   # at / below this => AVG_WINDOW_MIN_H
+AVG_WINDOW_TEMP_WARM = 5.0     # at / above this => AVG_WINDOW_MAX_H
+AVG_WINDOW_WRITE_EPS = 0.1     # don't spam helper writes
 
 
 # ============================================================
@@ -308,9 +434,164 @@ def _avg_future_outdoor(weather_entity, outdoor_entity):
     except Exception:
         return 0.0
 
+# ------------------------------------------------------------
+# Read float helper + enforce min/max demand limits by outdoor band
+# ------------------------------------------------------------
+def _read_float_entity(entity_id, default):
+    try:
+        v = float(state.get(entity_id))
+        return v if isfinite(v) else default
+    except Exception:
+        return default
+
+def _min_demand_floor_for_outdoor(u, Tout_bucket):
+    """
+    Returns the enforced minimum demand floor based on outdoor temperature bucket.
+
+    Bands (in whole-degree buckets, using int(round(Tout_raw))):
+      -10..-5   -> MIN_DEM_FLOOR_M05_M10
+      -15..-11  -> MIN_DEM_FLOOR_M11_M15
+      <= -16    -> MIN_DEM_FLOOR_LE_M16
+    """
+    floor = MIN_DEM
+
+    ent_05_10 = u.get("MIN_DEM_FLOOR_M05_M10")
+    ent_11_15 = u.get("MIN_DEM_FLOOR_M11_M15")
+    ent_le_16 = u.get("MIN_DEM_FLOOR_LE_M16")
+
+    if -10 <= Tout_bucket <= -5 and ent_05_10:
+        floor = _read_float_entity(ent_05_10, floor)
+    elif -15 <= Tout_bucket <= -11 and ent_11_15:
+        floor = _read_float_entity(ent_11_15, floor)
+    elif Tout_bucket <= -16 and ent_le_16:
+        floor = _read_float_entity(ent_le_16, floor)
+
+    floor = _clip(floor, 0.0, 100.0)
+    floor = max(MIN_DEM, floor)
+    return floor
+
+def _max_demand_cap_for_outdoor(u, Tout_bucket, default_cap):
+    """
+    Returns the enforced maximum demand cap based on outdoor temperature bucket.
+
+    Bands (in whole-degree buckets, using int(round(Tout_raw))):
+      -10..-5   -> MAX_DEM_CAP_M05_M10
+      -15..-11  -> MAX_DEM_CAP_M11_M15
+      <= -16    -> MAX_DEM_CAP_LE_M16
+
+    default_cap should already reflect other caps (global/icing/etc) for the current conditions.
+    """
+    cap = float(default_cap)
+
+    ent_05_10 = u.get("MAX_DEM_CAP_M05_M10")
+    ent_11_15 = u.get("MAX_DEM_CAP_M11_M15")
+    ent_le_16 = u.get("MAX_DEM_CAP_LE_M16")
+
+    if -10 <= Tout_bucket <= -5 and ent_05_10:
+        cap = _read_float_entity(ent_05_10, cap)
+    elif -15 <= Tout_bucket <= -11 and ent_11_15:
+        cap = _read_float_entity(ent_11_15, cap)
+    elif Tout_bucket <= -16 and ent_le_16:
+        cap = _read_float_entity(ent_le_16, cap)
+
+    cap = _clip(cap, 0.0, 100.0)
+    cap = max(MIN_DEM, cap)
+    return cap
+
+def _demand_change_min_interval_s(u):
+    ent = u.get("DEMAND_CHANGE_MIN_INTERVAL_HELPER")
+    if ent:
+        v = _read_float_entity(ent, DEMAND_CHANGE_MIN_INTERVAL_DEFAULT_S)
+    else:
+        v = DEMAND_CHANGE_MIN_INTERVAL_DEFAULT_S
+    # clamp to something sane: 0..600s
+    return _clip(v, 0.0, 600.0)
+
 
 # ============================================================
-# 4) PER-LAITE TILA (THETA/P + DEFROST-COOLDOWN)
+# Nordpool avg window dynamic update (based on hourly forecast)
+# ============================================================
+def _read_hourly_forecast_temps(forecast_sensor, hours=FORECAST_H):
+    """
+    Reads hourly forecast temperatures from an entity like sensor.weather_forecast_hourly
+    whose attributes include: forecast: [{temperature: ...}, ...]
+    Returns list[float] length <= hours.
+    """
+    attrs = state.getattr(forecast_sensor) or {}
+    fc = attrs.get("forecast") or []
+    temps = []
+    for i in range(min(hours, len(fc))):
+        t = fc[i].get("temperature")
+        if t is None:
+            continue
+        try:
+            tv = float(t)
+        except Exception:
+            continue
+        if isfinite(tv):
+            temps.append(tv)
+    return temps
+
+def _compute_outdoor_effective_temp_for_window(outdoor_entity):
+    """
+    Conservative effective outdoor temperature for window sizing.
+    Uses min(current_outdoor, avg_forecast_next_hours) when possible so that
+    if it's going to get colder soon, window shortens in advance.
+    """
+    Tout_cur = float("nan")
+    try:
+        Tout_cur = float(state.get(outdoor_entity))
+    except Exception:
+        Tout_cur = float("nan")
+
+    temps = _read_hourly_forecast_temps(WEATHER_FORECAST_HOURLY_SENSOR, hours=FORECAST_H)
+    Tout_fc = float("nan")
+    if temps:
+        Tout_fc = sum(temps) / float(len(temps))
+
+    candidates = []
+    if isfinite(Tout_cur):
+        candidates.append(Tout_cur)
+    if isfinite(Tout_fc):
+        candidates.append(Tout_fc)
+
+    if not candidates:
+        return 0.0
+
+    return min(candidates)
+
+def _temp_to_avg_window_hours(temp_c):
+    """
+    Linear map: AVG_WINDOW_TEMP_COLD..AVG_WINDOW_TEMP_WARM -> AVG_WINDOW_MIN_H..AVG_WINDOW_MAX_H
+    Colder -> shorter window.
+    """
+    t = _clip(temp_c, AVG_WINDOW_TEMP_COLD, AVG_WINDOW_TEMP_WARM)
+    span_t = (AVG_WINDOW_TEMP_WARM - AVG_WINDOW_TEMP_COLD)
+    if span_t <= 0:
+        return AVG_WINDOW_REF_H
+    frac = (t - AVG_WINDOW_TEMP_COLD) / span_t  # 0..1
+    hours = AVG_WINDOW_MIN_H + frac * (AVG_WINDOW_MAX_H - AVG_WINDOW_MIN_H)
+    return _clip(hours, AVG_WINDOW_MIN_H, AVG_WINDOW_MAX_H)
+
+def _update_nordpool_avg_window_hours(outdoor_entity):
+    """
+    Compute and write input_number.nordpool_avg_window_hours based on forecast+outdoor.
+    """
+    try:
+        temp_eff = _compute_outdoor_effective_temp_for_window(outdoor_entity)
+        new_h = float(_temp_to_avg_window_hours(temp_eff))
+        prev_h = float(state.get(NORDPOOL_AVG_WINDOW_HELPER) or new_h)
+        if (not isfinite(prev_h)) or abs(prev_h - new_h) > AVG_WINDOW_WRITE_EPS:
+            input_number.set_value(entity_id=NORDPOOL_AVG_WINDOW_HELPER, value=round(new_h, 2))
+    except Exception as e:
+        try:
+            log.debug("Daikin ML: failed to update nordpool avg window: %s", e)
+        except Exception:
+            pass
+
+
+# ============================================================
+# 4) PER-LAITE TILA (THETA/P + DEFROST-COOLDOWN + RATE LIMIT + 5min slope)
 # ============================================================
 _theta_by_unit_ctx = {}   # unit -> ctx -> theta[4]
 _P_by_unit_ctx     = {}   # unit -> ctx -> P[4x4]
@@ -318,6 +599,21 @@ _params_loaded     = {}   # unit -> bool
 
 _last_defrosting   = {}   # unit -> bool/None
 _cooldown_until    = {}   # unit -> epoch float
+
+# Track previous control error per unit (for soft-landing approach detection)
+_prev_err          = {}   # unit -> last err (float)
+
+# per-unit demand-change rate limiter state
+_last_demand_change_ts = {}  # unit -> epoch float of last *applied* change
+_last_demand_sig       = {}  # unit -> signature tuple
+
+# per-unit Tin history for 5-minute smoothed slope
+_tin_hist = {}  # unit -> list[(ts, Tin)]
+
+# Hold demand through defrost and for 5 minutes after defrost ends
+_hold_until = {}          # unit -> epoch float (0 if inactive)
+_held_select_option = {}  # unit -> string option, e.g. "70%" (or "70")
+_held_quiet_on = {}       # unit -> bool/None
 
 
 def _persist_all_stores():
@@ -338,6 +634,85 @@ def _init_unit_if_needed(unit_name):
         _last_defrosting[unit_name] = None
     if unit_name not in _cooldown_until:
         _cooldown_until[unit_name] = 0.0
+    if unit_name not in _prev_err:
+        _prev_err[unit_name] = None
+    if unit_name not in _last_demand_change_ts:
+        _last_demand_change_ts[unit_name] = 0.0
+    if unit_name not in _last_demand_sig:
+        _last_demand_sig[unit_name] = None
+    if unit_name not in _tin_hist:
+        _tin_hist[unit_name] = []
+    if unit_name not in _hold_until:
+        _hold_until[unit_name] = 0.0
+    if unit_name not in _held_select_option:
+        _held_select_option[unit_name] = None
+    if unit_name not in _held_quiet_on:
+        _held_quiet_on[unit_name] = None
+
+def _tin_hist_add(unit_name, ts, tin):
+    if not (isfinite(ts) and isfinite(tin)):
+        return
+    hist = _tin_hist.get(unit_name)
+    if hist is None:
+        hist = []
+        _tin_hist[unit_name] = hist
+    hist.append((float(ts), float(tin)))
+
+    # prune window + a small extra margin
+    cutoff = float(ts) - (TIN_SLOPE_WINDOW_S + 30.0)
+    new_hist = []
+    for t, v in hist:
+        if isfinite(t) and isfinite(v) and t >= cutoff:
+            new_hist.append((t, v))
+    if len(new_hist) > 200:
+        new_hist = new_hist[-200:]
+    _tin_hist[unit_name] = new_hist
+
+def _tin_smoothed_rate_5min(unit_name, now_ts):
+    """
+    Returns (rate_degC_per_hour, used_smoothed, span_s, n_samples)
+    Uses linear regression slope over last ~5 minutes for smoothing.
+    """
+    hist = _tin_hist.get(unit_name) or []
+    if len(hist) < TIN_SLOPE_MIN_SAMPLES:
+        return 0.0, False, 0.0, len(hist)
+
+    cutoff = float(now_ts) - TIN_SLOPE_WINDOW_S
+    pts = [(t, v) for (t, v) in hist if t >= cutoff]
+    if len(pts) < TIN_SLOPE_MIN_SAMPLES:
+        return 0.0, False, 0.0, len(pts)
+
+    t0 = pts[0][0]
+    t1 = pts[-1][0]
+    span = float(t1 - t0)
+    if span < TIN_SLOPE_MIN_SPAN_S:
+        return 0.0, False, span, len(pts)
+
+    ts = [p[0] for p in pts]
+    vs = [p[1] for p in pts]
+    t_mean = sum(ts) / float(len(ts))
+    v_mean = sum(vs) / float(len(vs))
+
+    num = 0.0
+    den = 0.0
+    for t, v in pts:
+        dt = (t - t_mean)
+        dv = (v - v_mean)
+        num += dt * dv
+        den += dt * dt
+
+    if (not isfinite(den)) or den <= 1e-9 or (not isfinite(num)):
+        return 0.0, False, span, len(pts)
+
+    slope_degC_per_s = num / den
+    if not isfinite(slope_degC_per_s):
+        return 0.0, False, span, len(pts)
+
+    rate_h = slope_degC_per_s * 3600.0
+    if not isfinite(rate_h):
+        return 0.0, False, span, len(pts)
+
+    return float(rate_h), True, span, len(pts)
 
 def _load_params_from_store(unit):
     unit_name = unit["name"]
@@ -404,17 +779,72 @@ def _init_context_params_if_needed(unit):
     _params_loaded[unit_name] = True
 
 
+def _read_defrosting(u):
+    """Return (defrosting_bool, liquid_float)."""
+    LIQUID = u["LIQUID"]
+    try:
+        liquid = float(state.get(LIQUID) or 100.0)
+    except Exception:
+        liquid = 100.0
+    if not isfinite(liquid):
+        liquid = 100.0
+    return (liquid < DEFROST_LIQUID_THRESHOLD), liquid
+
+def _update_tin_history_only(u):
+    """
+    Called from state_trigger runs:
+    - only update Tin history (for 5-minute smoothed slope)
+    - do NOT publish learned demand or apply control
+    - during defrost or post-defrost hold: do not collect Tin at all
+    """
+    unit_name = u["name"]
+    _init_unit_if_needed(unit_name)
+
+    now = time.time()
+    defrosting, _liq = _read_defrosting(u)
+    hold_active = (now < float(_hold_until.get(unit_name) or 0.0))
+
+    if defrosting or hold_active:
+        return
+
+    INDOOR = u["INDOOR"]
+    try:
+        Tin = float(state.get(INDOOR))
+    except Exception:
+        Tin = float("nan")
+    if isfinite(Tin):
+        _tin_hist_add(unit_name, now, Tin)
+
 # ============================================================
 # 5) STARTUP + TRIGGERIT
 # ============================================================
 _persist_all_stores()
 
-_TRIGGER_ENTITIES = []
+# Build a single pyscript trigger expression string: "sensor.a or sensor.b"
+_INDOOR_TRIGGERS = []
 for u in DAIKINS:
-    for k in ("INDOOR", "OUTDOOR", "INDOOR_RATE"):
-        ent = u.get(k)
-        if ent:
-            _TRIGGER_ENTITIES.append(ent)
+    ent = u.get("INDOOR")
+    if ent and isinstance(ent, str):
+        _INDOOR_TRIGGERS.append(ent)
+
+_seen = set()
+_INDOOR_TRIGGERS = [x for x in _INDOOR_TRIGGERS if not (x in _seen or _seen.add(x))]
+_INDOOR_TRIGGER_EXPR = " or ".join(_INDOOR_TRIGGERS) if _INDOOR_TRIGGERS else None
+
+# ------------------------------------------------------------
+# FIX (multi-unit cross-talk):
+# identify which INDOOR entity triggered this run (if state_trigger)
+# ------------------------------------------------------------
+def _get_trigger_entity_from_kwargs(kwargs):
+    """
+    Pyscript versions differ; try common keys and return an entity_id like 'sensor.xxx'.
+    If not found, return None (e.g., cron run).
+    """
+    for k in ("entity_id", "var_name", "trigger_entity", "trigger_var", "trigger"):
+        v = kwargs.get(k)
+        if isinstance(v, str) and "." in v:
+            return v
+    return None
 
 @time_trigger("startup")
 def _ml_startup_ok():
@@ -433,15 +863,86 @@ def _ml_startup_ok():
 
     log.info("Daikin ML MULTI: startup loaded for %d unit(s)", len(DAIKINS))
 
-@time_trigger("cron(*/6 * * * *)")
-@state_trigger(*_TRIGGER_ENTITIES)
-def daikin_ml_controller(**kwargs):
-    for u in DAIKINS:
-        try:
-            _run_one_unit(u)
-        except Exception as e:
-            log.error("Daikin ML (%s): controller error: %s", u.get("name", "?"), e)
+# Run on every INDOOR change (collect Tin history only) + periodic cron (full control + publish learned demand)
+if _INDOOR_TRIGGER_EXPR:
+    @time_trigger("cron(*/5 * * * *)")  # TRUE 5-minute cadence
+    @state_trigger(_INDOOR_TRIGGER_EXPR)
+    def daikin_ml_controller(**kwargs):
 
+        # Update Nordpool averaging window hours dynamically based on outdoor forecast (colder -> shorter)
+        try:
+            temps_eff = []
+            for uu in DAIKINS:
+                oe = uu.get("OUTDOOR")
+                if oe:
+                    try:
+                        temps_eff.append(_compute_outdoor_effective_temp_for_window(oe))
+                    except Exception:
+                        pass
+            if temps_eff:
+                temp_eff = min(temps_eff)
+                new_h = float(_temp_to_avg_window_hours(temp_eff))
+                prev_h = float(state.get(NORDPOOL_AVG_WINDOW_HELPER) or new_h)
+                if (not isfinite(prev_h)) or abs(prev_h - new_h) > AVG_WINDOW_WRITE_EPS:
+                    input_number.set_value(entity_id=NORDPOOL_AVG_WINDOW_HELPER, value=round(new_h, 2))
+        except Exception as e:
+            try:
+                log.debug("Daikin ML: avg window update failed: %s", e)
+            except Exception:
+                pass
+
+
+        trig_ent = _get_trigger_entity_from_kwargs(kwargs)
+        is_cron = (trig_ent is None)
+
+        # If this was triggered by an indoor sensor update, ONLY update Tin history and exit.
+        if not is_cron and trig_ent:
+            for uu in DAIKINS:
+                if uu.get("INDOOR") == trig_ent:
+                    try:
+                        _update_tin_history_only(uu)
+                    except Exception as e:
+                        log.debug("Daikin ML (%s): Tin history update failed: %s", uu.get("name", "?"), e)
+                    break
+            return
+
+        # Cron run: run full controller and publish learned demand (and apply control) for all units.
+        for u in DAIKINS:
+            try:
+                _run_one_unit(u)
+            except Exception as e:
+                log.error("Daikin ML (%s): controller error: %s", u.get("name", "?"), e)
+else:
+    @time_trigger("cron(*/5 * * * *)")  # TRUE 5-minute cadence
+    def daikin_ml_controller(**kwargs):
+
+        # Update Nordpool averaging window hours dynamically based on outdoor forecast (colder -> shorter)
+        try:
+            temps_eff = []
+            for uu in DAIKINS:
+                oe = uu.get("OUTDOOR")
+                if oe:
+                    try:
+                        temps_eff.append(_compute_outdoor_effective_temp_for_window(oe))
+                    except Exception:
+                        pass
+            if temps_eff:
+                temp_eff = min(temps_eff)
+                new_h = float(_temp_to_avg_window_hours(temp_eff))
+                prev_h = float(state.get(NORDPOOL_AVG_WINDOW_HELPER) or new_h)
+                if (not isfinite(prev_h)) or abs(prev_h - new_h) > AVG_WINDOW_WRITE_EPS:
+                    input_number.set_value(entity_id=NORDPOOL_AVG_WINDOW_HELPER, value=round(new_h, 2))
+        except Exception as e:
+            try:
+                log.debug("Daikin ML: avg window update failed: %s", e)
+            except Exception:
+                pass
+
+        for u in DAIKINS:
+            try:
+                _run_one_unit(u)
+            except Exception as e:
+                log.error("Daikin ML (%s): controller error: %s", u.get("name", "?"), e)
 
 # ============================================================
 # 6) VARSINAINEN LOGIIKKA PER LAITE
@@ -449,6 +950,7 @@ def daikin_ml_controller(**kwargs):
 def _run_one_unit(u):
     unit_name = u["name"]
     _init_context_params_if_needed(u)
+    _init_unit_if_needed(unit_name)
 
     INDOOR = u["INDOOR"]
     INDOOR_RATE = u["INDOOR_RATE"]
@@ -472,32 +974,130 @@ def _run_one_unit(u):
     except Exception:
         Tout_raw = float("nan")
 
-    # RATE FIX: float("nan") does not raise -> must isfinite-check
-    try:
-        rate = float(state.get(INDOOR_RATE) or 0.0)
-    except Exception:
-        rate = 0.0
-    if not isfinite(rate):
-        log.warning(
-            "Daikin ML (%s): INDOOR_RATE not finite (%s) -> forcing 0.0 and skipping learning this tick",
-            unit_name, str(state.get(INDOOR_RATE))
-        )
-        rate = 0.0
-        rate_bad = True
-    else:
-        rate_bad = False
+    now = time.time()
 
-    sp = float(state.get(SP_HELPER) or 22.5)
+
+    # Tin history is appended only when not defrosting and not in post-defrost hold.
+
+    # ------------------------------------------------------------
+    # NEW: Learning rate uses smoothed 5-minute Tin slope.
+    # If not enough history yet, fall back to the derivative sensor.
+    # ------------------------------------------------------------
+    rate = 0.0
+    rate_bad = False
+    rate_source = "unknown"
+    rate_span_s = 0.0
+    rate_n = 0
+
+    # ----------------------------
+    # Effective setpoint = base + (optional Nordpool bias), clamped by guards
+    # ----------------------------
+    SP_BASE_HELPER = u.get("SP_BASE_HELPER", "input_number.daikin_setpoint_base")
+    PRICE_BIAS_HELPER = u.get("PRICE_BIAS_HELPER")
+    PRICE_BIAS_ENABLED = u.get("PRICE_BIAS_ENABLED", "input_boolean.nordpool_bias_enabled")
+    MIN_TEMP_GUARD_HELPER = u.get("MIN_TEMP_GUARD_HELPER")
+    MAX_TEMP_GUARD_HELPER = u.get("MAX_TEMP_GUARD_HELPER")
+
+    # 1) Read manual base setpoint (user-controlled)
+    try:
+        sp_base = float(state.get(SP_BASE_HELPER) or SP_BASE_DEFAULT)
+    except Exception:
+        sp_base = SP_BASE_DEFAULT
+    if not isfinite(sp_base):
+        sp_base = SP_BASE_DEFAULT
+
+    # 2) Check Nordpool bias enable
+    bias_enabled = (state.get(PRICE_BIAS_ENABLED) == "on")
+
+    # 3) Read bias points (if enabled)
+    if bias_enabled and PRICE_BIAS_HELPER:
+        try:
+            bias_points = float(state.get(PRICE_BIAS_HELPER) or 0.0)
+        except Exception:
+            bias_points = 0.0
+        if not isfinite(bias_points):
+            bias_points = 0.0
+    else:
+        bias_points = 0.0
+
+    # 4) Read dynamic averaging window hours and convert to a scaling factor
+    try:
+        avg_window_h = float(state.get(NORDPOOL_AVG_WINDOW_HELPER) or AVG_WINDOW_REF_H)
+    except Exception:
+        avg_window_h = AVG_WINDOW_REF_H
+    if (not isfinite(avg_window_h)) or (avg_window_h <= 0.0):
+        avg_window_h = AVG_WINDOW_REF_H
+
+    # Shorter averaging window (colder) => stronger response; longer => weaker
+    avg_window_factor = _clip(AVG_WINDOW_REF_H / avg_window_h, AVG_WINDOW_FACTOR_MIN, AVG_WINDOW_FACTOR_MAX)
+
+    # 5) Convert bias points -> °C shift, apply window scaling, then clamp
+    sp_bias_degC = _clip(bias_points * SP_BIAS_DEGC_PER_POINT * avg_window_factor, SP_BIAS_CLAMP_MIN, SP_BIAS_CLAMP_MAX)
+
+    # Effective setpoint
+    sp = sp_base + sp_bias_degC
+
+    # 6) Apply min/max guard clamps (per unit)
+    try:
+        sp_min_guard = float(state.get(MIN_TEMP_GUARD_HELPER) or MIN_GUARD_DEFAULT) if MIN_TEMP_GUARD_HELPER else MIN_GUARD_DEFAULT
+    except Exception:
+        sp_min_guard = MIN_GUARD_DEFAULT
+    try:
+        sp_max_guard = float(state.get(MAX_TEMP_GUARD_HELPER) or MAX_GUARD_DEFAULT) if MAX_TEMP_GUARD_HELPER else MAX_GUARD_DEFAULT
+    except Exception:
+        sp_max_guard = MAX_GUARD_DEFAULT
+
+    if not isfinite(sp_min_guard):
+        sp_min_guard = MIN_GUARD_DEFAULT
+    if not isfinite(sp_max_guard):
+        sp_max_guard = MAX_GUARD_DEFAULT
+
+    if sp_min_guard > sp_max_guard:
+        sp_min_guard, sp_max_guard = sp_max_guard, sp_min_guard
+
+    sp = _clip(sp, sp_min_guard, sp_max_guard)
+
+    # 7) Write effective setpoint into SP_HELPER (input_number.daikin_setpoint)
+    try:
+        sp_prev = float(state.get(SP_HELPER) or sp)
+        if (not isfinite(sp_prev)) or abs(sp_prev - sp) > SP_WRITE_EPS:
+            input_number.set_value(entity_id=SP_HELPER, value=round(float(sp), 2))
+    except Exception as e:
+        log.debug("Could not write effective setpoint to %s err=%s", SP_HELPER, e)
 
     step_limit_current = float(state.get(STEP_LIMIT_HELPER) or 10.0)
     deadband_current   = float(state.get(DEADBAND_HELPER) or 0.1)
 
     prev_str = state.get(SELECT) or ""
     try:
-        prev = float(prev_str.replace('%', ''))
+        prev_base = float(prev_str.replace('%', ''))
     except Exception:
-        prev = 60.0
+        prev_base = 60.0
 
+    # Quiet outdoor switch adds an extra "layer" at max demand:
+    #  - select=100 + quiet_outdoor ON  => effective demand 100
+    #  - select=100 + quiet_outdoor OFF => effective demand 105
+    QUIET_SW = u.get("QUIET_OUTDOOR_SWITCH")
+    quiet_state = None
+    quiet_on = None
+    if QUIET_SW:
+        quiet_state = state.get(QUIET_SW)
+        quiet_on = (quiet_state == "on")
+
+    unit_has_quiet = bool(QUIET_SW)
+    unit_max_dem = MAX_DEM_LAYER if unit_has_quiet else MAX_DEM
+
+    prev = prev_base
+    if isfinite(prev_base) and prev_base >= 100.0 - 1e-6 and (quiet_on is False):
+        prev = unit_max_dem
+
+
+    # ------------------------------------------------------------
+    # Defrost + post-defrost hold behavior:
+    # - Freeze to the pre-defrost demand during defrost
+    # - Keep same demand for 5 minutes after defrost ends
+    # - Do not collect/use Tin measurements until hold period ends
+    # ------------------------------------------------------------
     try:
         liquid = float(state.get(LIQUID) or 100.0)
     except Exception:
@@ -505,16 +1105,89 @@ def _run_one_unit(u):
     if not isfinite(liquid):
         liquid = 100.0
 
-    defrosting = (liquid < 20.0)
+    defrosting = (liquid < DEFROST_LIQUID_THRESHOLD)
 
-    now = time.time()
     if _last_defrosting[unit_name] is None:
         _last_defrosting[unit_name] = defrosting
+
+    # Entering defrost: capture current demand and clear Tin history
+    if (_last_defrosting[unit_name] is False) and (defrosting is True):
+        _held_select_option[unit_name] = prev_str
+        _held_quiet_on[unit_name] = quiet_on if unit_has_quiet else None
+        _hold_until[unit_name] = 0.0
+        _tin_hist[unit_name] = []
+        log.info(
+            "Daikin ML (%s): entering defrost -> holding demand select=%s quiet=%s",
+            unit_name, str(_held_select_option[unit_name]), str(_held_quiet_on[unit_name])
+        )
+
+    # Exiting defrost: start cooldown as before + start 5-minute hold
     if (_last_defrosting[unit_name] is True) and (defrosting is False):
         _cooldown_until[unit_name] = now + COOLDOWN_MINUTES * 60.0
-        log.info("Daikin ML (%s): defrost ended -> cooldown active for %d min", unit_name, COOLDOWN_MINUTES)
+        _hold_until[unit_name] = now + POST_DEFROST_HOLD_S
+        _tin_hist[unit_name] = []
+        log.info(
+            "Daikin ML (%s): defrost ended -> cooldown %d min, holding pre-defrost demand for %.0f s",
+            unit_name, COOLDOWN_MINUTES, float(POST_DEFROST_HOLD_S)
+        )
+
     _last_defrosting[unit_name] = defrosting
+    hold_active = (now < float(_hold_until.get(unit_name) or 0.0))
     in_cooldown = (now < _cooldown_until[unit_name])
+
+    # During defrost or hold: enforce held demand and skip using Tin measurements
+    if defrosting or hold_active:
+        held_opt = _held_select_option.get(unit_name) or prev_str
+        held_quiet = _held_quiet_on.get(unit_name) if unit_has_quiet else None
+
+        # Enforce select option
+        if held_opt and held_opt != prev_str:
+            try:
+                select.select_option(entity_id=SELECT, option=held_opt)
+                prev_str = held_opt
+            except Exception as e:
+                log.error("Daikin ML (%s): failed to enforce held select %s: %s", unit_name, held_opt, e)
+
+        # Enforce quiet state if available
+        if unit_has_quiet and held_quiet is not None and QUIET_SW:
+            try:
+                if held_quiet and (quiet_on is False):
+                    switch.turn_on(entity_id=QUIET_SW)
+                    quiet_on = True
+                elif (not held_quiet) and (quiet_on is True):
+                    switch.turn_off(entity_id=QUIET_SW)
+                    quiet_on = False
+            except Exception:
+                pass
+
+        # Publish learned demand as held (cron-only publishing already)
+        try:
+            held_num = float(str(held_opt).replace('%', '')) if held_opt else float(prev_base)
+        except Exception:
+            held_num = float(prev_base) if isfinite(prev_base) else 0.0
+
+        try:
+            state.set(
+                LEARNED_SENSOR,
+                value=round(float(held_num), 1),
+                unit=unit_name,
+                ctx="hold",
+                defrosting=defrosting,
+                post_defrost_hold=hold_active,
+                hold_until=round(float(_hold_until.get(unit_name) or 0.0), 1),
+                held_select=str(held_opt),
+                held_quiet=bool(held_quiet) if unit_has_quiet and held_quiet is not None else None,
+                liquid=round(float(liquid), 1),
+            )
+        except Exception as e:
+            log.error("Daikin ML (%s): failed to publish held learned demand: %s", unit_name, e)
+
+        return
+
+    # Normal operation resumes here (defrost false, hold ended).
+    # Tin measurements are allowed again; start building history from scratch.
+    if isfinite(Tin):
+        _tin_hist_add(unit_name, now, Tin)
 
     if not (isfinite(Tin) and isfinite(Tout_raw)):
         log.info("Daikin ML (%s): sensors not ready; Tin=%s Tout=%s", unit_name, state.get(INDOOR), state.get(OUTDOOR))
@@ -522,6 +1195,9 @@ def _run_one_unit(u):
 
     Tout_bucket = int(round(Tout_raw))
     ctx = _context_key_for_outdoor(Tout_raw)
+
+    # Minimum demand floor for this outdoor band (hard constraint)
+    min_floor = _min_demand_floor_for_outdoor(u, Tout_bucket)
 
     if ctx not in _theta_by_unit_ctx[unit_name]:
         _theta_by_unit_ctx[unit_name][ctx] = [0.0, 0.0, 5.0, 0.0]
@@ -534,7 +1210,6 @@ def _run_one_unit(u):
     theta = _theta_by_unit_ctx[unit_name][ctx]
     P     = _P_by_unit_ctx[unit_name][ctx]
 
-    # theta guard: if somehow corrupted, reset to defaults (per ctx)
     if not _all_finite(theta):
         log.error("Daikin ML (%s): theta not finite for ctx=%s -> resetting theta/P", unit_name, ctx)
         theta = [0.0, 0.0, 5.0, 0.0]
@@ -566,37 +1241,105 @@ def _run_one_unit(u):
     in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
     band_upper = min(global_upper, icing_cap) if in_icing_band else global_upper
 
+    # apply max cap by outdoor band
+    band_upper = min(band_upper, _max_demand_cap_for_outdoor(u, Tout_bucket, band_upper))
+
+    # If min_floor is higher than computed band_upper, lift the band_upper:
+    if min_floor > band_upper:
+        log.warning(
+            "Daikin ML (%s): min_floor %.1f > band_upper %.1f (conflict: min vs max). Lifting upper to min_floor.",
+            unit_name, float(min_floor), float(band_upper)
+        )
+        band_upper = min_floor
+
+    # cooldown rule: during cooldown, upper must be 100 with quiet ON (no 105 layer)
+    unit_max_dem_eff = unit_max_dem
+    if in_cooldown and unit_has_quiet:
+        band_upper = min(band_upper, 100.0)
+        unit_max_dem_eff = 100.0
+
+    band_upper_layer = band_upper if band_upper < 100.0 else unit_max_dem_eff
+
     # jos edellinen yli band_upper, tiputetaan heti
-    if prev > band_upper:
+    if prev > band_upper_layer:
         option_cap = _snap_to_select(SELECT, band_upper, -1)
         if option_cap and option_cap != prev_str:
             select.select_option(entity_id=SELECT, option=option_cap)
-            log.info(
-                "Daikin ML (%s): CAP ENFORCED: prev=%s -> %s (upper=%.0f%%, ctx=%s, Tout_bucket=%d)",
-                unit_name, prev_str, option_cap, band_upper, ctx, Tout_bucket,
-            )
+
+        # Ensure quiet outdoor is ON when capping / cooldown (per-unit)
+        if QUIET_SW and (quiet_on is False):
+            if in_cooldown or band_upper < 100.0 or abs(prev - unit_max_dem) < 1e-6:
+                try:
+                    switch.turn_on(entity_id=QUIET_SW)
+                    quiet_on = True
+                except Exception:
+                    pass
+
+        log.info(
+            "Daikin ML (%s): CAP ENFORCED: prev=%s -> %s (upper=%.0f%%, ctx=%s, Tout_bucket=%d)",
+            unit_name, prev_str, option_cap, band_upper, ctx, Tout_bucket,
+        )
         return
 
-    prev_eff = prev if prev <= band_upper else band_upper
+    prev_eff = prev if prev <= band_upper_layer else band_upper_layer
+
+    # ------------------------------------------------------------
+    # Learning rate uses smoothed 5-minute Tin slope.
+    # If not enough history yet, fall back to the derivative sensor.
+    # ------------------------------------------------------------
+    sm_rate, used_smoothed, span_s, n_pts = _tin_smoothed_rate_5min(unit_name, now)
+    if used_smoothed and isfinite(sm_rate):
+        rate = float(sm_rate)
+        rate_bad = False
+        rate_source = "smoothed_5min"
+        rate_span_s = float(span_s)
+        rate_n = int(n_pts)
+    else:
+        # Fallback: derivative sensor (existing behavior)
+        try:
+            rate = float(state.get(INDOOR_RATE) or 0.0)
+        except Exception:
+            rate = 0.0
+        if not isfinite(rate):
+            log.warning(
+                "Daikin ML (%s): INDOOR_RATE not finite (%s) -> forcing 0.0 and skipping learning this tick",
+                unit_name, str(state.get(INDOOR_RATE))
+            )
+            rate = 0.0
+            rate_bad = True
+        else:
+            rate_bad = False
+        rate_source = "derivative_fallback"
+        rate_span_s = float(span_s) if isfinite(span_s) else 0.0
+        rate_n = int(n_pts) if isinstance(n_pts, int) else 0
 
     err         = sp - Tin
     demand_norm = _clip(prev_eff / 100.0, 0.0, 1.0)
     x = [1.0, err, demand_norm, (Tout_raw - Tin)]
     y = rate
 
-    allow_learning = (not defrosting) and (not in_cooldown) and (not rate_bad)
+    allow_learning = (not defrosting) and (not hold_active) and (not in_cooldown) and (not rate_bad)
 
     if allow_learning:
-        # backup in case of corruption
         theta_prev = theta[:]
         P_prev = [row[:] for row in P]
 
         theta_new, P_new = _rls_update(theta, P, x, y)
 
-        # ensure finite
         if _all_finite(theta_new):
             theta = theta_new
-            P = P_new
+            try:
+                tr = float(P_new[0][0] + P_new[1][1] + P_new[2][2] + P_new[3][3])
+            except Exception:
+                tr = float("nan")
+            if (not isfinite(tr)) or tr <= 1e-9:
+                log.warning("RLS reset for %s/%s: P_update_trace_nonpositive", unit_name, ctx)
+                P = [[P0, 0, 0, 0],
+                     [0, P0, 0, 0],
+                     [0, 0, P0, 0],
+                     [0, 0, 0, P0]]
+            else:
+                P = P_new
             _theta_by_unit_ctx[unit_name][ctx] = theta
             _P_by_unit_ctx[unit_name][ctx] = P
             _save_params_to_store(u)
@@ -610,8 +1353,8 @@ def _run_one_unit(u):
         _theta_by_unit_ctx[unit_name][ctx] = theta
         _P_by_unit_ctx[unit_name][ctx] = P
         log.debug(
-            "Daikin ML (%s): learning paused (defrost=%s, cooldown=%s, rate_bad=%s, ctx=%s)",
-            unit_name, defrosting, in_cooldown, rate_bad, ctx,
+            "Daikin ML (%s): learning paused (defrost=%s, hold=%s, cooldown=%s, rate_bad=%s, ctx=%s, rate_source=%s)",
+            unit_name, defrosting, hold_active, in_cooldown, rate_bad, ctx, rate_source,
         )
 
     Tout_future = _avg_future_outdoor(WEATHER, OUTDOOR)
@@ -621,7 +1364,6 @@ def _run_one_unit(u):
     num = dTin_target - (theta[0] + theta[1] * err + theta[3] * (Tout_eff - Tin))
 
     denom_raw = theta[2]
-    # denom guard
     if (not isfinite(denom_raw)) or abs(denom_raw) < 1e-6:
         denom_raw = 5.0
 
@@ -630,9 +1372,8 @@ def _run_one_unit(u):
     if denom_mag < 0.5:
         denom_mag = 0.5
 
-    dem_opt = _clip((num / (denom_mag * denom_sign)) * 100.0, 0.0, 100.0)
+    dem_opt = _clip((num / (denom_mag * denom_sign)) * 100.0, 0.0, unit_max_dem_eff)
 
-    # dem_opt guard (belt-and-suspenders): never allow NaN into sensor/logics
     if not isfinite(dem_opt):
         log.error(
             "Daikin ML (%s): dem_opt became non-finite (ctx=%s). Falling back to prev_eff=%.1f",
@@ -640,7 +1381,14 @@ def _run_one_unit(u):
         )
         dem_opt = prev_eff
 
-    # Learned demand -sensori (raaka ML-optimi)
+    # Quiet outdoor extra layer (OPTIONAL): only if unit has quiet switch.
+    # never allow 105 layer during cooldown
+    if (not in_cooldown) and unit_has_quiet and dem_opt >= 100.0 - 1e-6 and err > deadband:
+        over = _clip((err - deadband) * 2.0, 0.0, QUIET_LAYER_EXTRA)
+        dem_opt = _clip(100.0 + over, 100.0, unit_max_dem_eff)
+    elif in_cooldown and unit_has_quiet and dem_opt >= 100.0 - 1e-6:
+        dem_opt = 100.0
+
     try:
         state.set(
             LEARNED_SENSOR,
@@ -650,36 +1398,94 @@ def _run_one_unit(u):
             outdoor_bucket=Tout_bucket,
             outdoor=round(Tout_raw, 1),
             setpoint=round(sp, 2),
+            sp_base=round(float(sp_base), 2),
+            sp_bias_degC=round(float(sp_bias_degC), 3),
+            bias_points=round(float(bias_points), 3),
+            bias_enabled=bias_enabled,
+            avg_window_h=round(float(avg_window_h), 2),
+            avg_window_factor=round(float(avg_window_factor), 3),
+            sp_min_guard=round(float(sp_min_guard), 2),
+            sp_max_guard=round(float(sp_max_guard), 2),
+            sp_effective=round(float(sp), 2),
             indoor=round(Tin, 2),
             defrosting=defrosting,
+            post_defrost_hold=hold_active,
+            hold_until=round(float(_hold_until.get(unit_name) or 0.0), 1),
             cooldown=in_cooldown,
-            rate=round(rate, 4),
+            rate=round(float(rate), 4),
+            rate_source=rate_source,
+            rate_span_s=round(float(rate_span_s), 1),
+            rate_n=int(rate_n),
+            quiet_outdoor=quiet_state,
+            demand_layer_max=(unit_max_dem_eff if (unit_has_quiet and band_upper >= 100.0) else band_upper),
+            min_floor=round(float(min_floor), 1),
+            max_cap=round(float(band_upper), 1),
         )
     except Exception as e:
         log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
 
-    # Deadband: pidä ennallaan
+    # Deadband / efficiency:
     if abs(err) <= deadband:
-        dem_target = prev_eff
+        trim = EFF_TRIM_STEP_FAST if err < 0 else EFF_TRIM_STEP
+        if trim > step_limit:
+            trim = step_limit
+        dem_target = max(min_floor, prev_eff - trim)
     else:
         dem_target = dem_opt
+
+    # 105-layer stick fix: if stable or above, force back to 100
+    if unit_has_quiet and prev_eff > 100.0 and (abs(err) <= deadband or err <= 0.0):
+        dem_target = min(dem_target, 100.0)
+
+    # cooldown rule: force max 100
+    if in_cooldown and unit_has_quiet:
+        dem_target = min(dem_target, 100.0)
 
     # Monotoninen ehto: jos ollaan kylmällä puolella, demand ei saa laskea
     if err > deadband and dem_target < prev_eff:
         dem_target = prev_eff
 
+    # Soft landing
+    abs_err = abs(err)
+    prev_err = _prev_err.get(unit_name)
+    approaching = False
+    if prev_err is not None and isfinite(float(prev_err)):
+        if err > 0 and prev_err > 0 and (err < (prev_err - SOFT_APPROACH_EPS)):
+            approaching = True
+        elif err < 0 and prev_err < 0 and (err > (prev_err + SOFT_APPROACH_EPS)):
+            approaching = True
+
+    if approaching and abs_err <= SOFT_ERR_START:
+        if SOFT_ERR_START > SOFT_ERR_END:
+            soft_factor = _clip((abs_err - SOFT_ERR_END) / (SOFT_ERR_START - SOFT_ERR_END), 0.0, 1.0)
+        else:
+            soft_factor = 1.0
+
+        dem_target = prev_eff + soft_factor * (dem_target - prev_eff)
+        step_limit_soft = max(SOFT_STEP_MIN, step_limit * soft_factor)
+    else:
+        step_limit_soft = step_limit
+
     # delta ja step/cooldown -rajat
     delta = dem_target - prev_eff
     if delta > 0:
-        up_limit = COOLDOWN_STEP_UP if in_cooldown else step_limit
+        up_limit = COOLDOWN_STEP_UP if in_cooldown else step_limit_soft
         if delta > up_limit:
             dem_target = prev_eff + up_limit
     elif delta < 0:
-        down_limit = step_limit
+        down_limit = step_limit_soft
         if -delta > down_limit:
             dem_target = prev_eff - down_limit
 
-    dem_clip = _clip(dem_target, MIN_DEM, band_upper)
+    # Final clamp now respects the outdoor-band minimum floor and maximum cap
+    dem_clip = _clip(dem_target, min_floor, band_upper_layer)
+
+    stable_or_above = (abs(err) <= deadband) or (err <= 0.0)
+    if unit_has_quiet and stable_or_above and dem_clip >= 100.0 - 1e-6:
+        dem_clip = 100.0
+    if in_cooldown and unit_has_quiet and dem_clip >= 100.0 - 1e-6:
+        dem_clip = 100.0
+
     option = _snap_to_select(SELECT, dem_clip, 0)
 
     try:
@@ -693,21 +1499,94 @@ def _run_one_unit(u):
             unit_name, option, band_upper, ctx, Tout_bucket,
         )
 
-    if option and option != prev_str:
-        select.select_option(entity_id=SELECT, option=option)
+    # Apply demand command:
+    desired_layer = float(dem_clip)
+    desired_base = desired_layer if desired_layer < 100.0 else 100.0
+    desired_option = _snap_to_select(SELECT, desired_base, 0)
+
+    # Determine what quiet state we want (per-unit)
+    desired_quiet = None
+    if QUIET_SW and desired_base >= 100.0 - 1e-6:
+        if in_cooldown:
+            desired_quiet = True
+        elif stable_or_above:
+            desired_quiet = True
+        else:
+            desired_quiet = (desired_layer <= 100.0 + 1e-6)
+    elif QUIET_SW:
+        desired_quiet = True if (prev >= 100.0 - 1e-6 and (quiet_on is False)) else quiet_on
+
+    # per-unit minimum interval between applied demand changes
+    min_interval_s = float(_demand_change_min_interval_s(u))
+    current_sig = (str(prev_str), bool(quiet_on) if unit_has_quiet else None)
+    desired_sig = (str(desired_option), bool(desired_quiet) if unit_has_quiet else None)
+
+    if desired_sig != current_sig and min_interval_s > 0.0:
+        last_ts = float(_last_demand_change_ts.get(unit_name) or 0.0)
+        dt = now - last_ts
+        if dt < min_interval_s:
+            log.info(
+                "Daikin ML (%s): demand change rate-limited (%.1fs < %.1fs). Keeping select=%s quiet=%s, wanted select=%s quiet=%s",
+                unit_name, dt, min_interval_s,
+                str(prev_str), str(quiet_on),
+                str(desired_option), str(desired_quiet),
+            )
+            _prev_err[unit_name] = err
+            return
+
+    # Actually apply changes (if any)
+    applied_any = False
+
+    if desired_option and desired_option != prev_str:
+        try:
+            select.select_option(entity_id=SELECT, option=desired_option)
+            applied_any = True
+        except Exception as e:
+            log.error("Daikin ML (%s): failed to set select %s -> %s: %s", unit_name, prev_str, desired_option, e)
+
+    if QUIET_SW and desired_base >= 100.0 - 1e-6:
+        want_quiet_on = True if desired_quiet is True else False
+        if want_quiet_on and (quiet_on is False):
+            try:
+                switch.turn_on(entity_id=QUIET_SW)
+                quiet_on = True
+                applied_any = True
+            except Exception:
+                pass
+        elif (not want_quiet_on) and (quiet_on is True):
+            try:
+                switch.turn_off(entity_id=QUIET_SW)
+                quiet_on = False
+                applied_any = True
+            except Exception:
+                pass
+    elif QUIET_SW and desired_base < 100.0 - 1e-6:
+        if prev >= 100.0 - 1e-6 and (quiet_on is False):
+            try:
+                switch.turn_on(entity_id=QUIET_SW)
+                quiet_on = True
+                applied_any = True
+            except Exception:
+                pass
+
+    if applied_any:
+        _last_demand_change_ts[unit_name] = now
+        _last_demand_sig[unit_name] = desired_sig
+
+    _prev_err[unit_name] = err
 
     theta_str = "[" + ", ".join([str(round(float(v), 4)) for v in theta]) + "]"
     cool_str  = "ACTIVE" if in_cooldown else "off"
     icing_str = "ON" if in_icing_band else "off"
     log.info(
         "Daikin ML (%s): ctx=%s | Tin=%.2f°C, Tout=%.2f°C (bucket=%d, →%.1f°C), "
-        "DEFROST=%s, cooldown=%s, rate_bad=%s, "
-        "icing_band=%s, band_upper=%.0f%%, theta=%s | "
+        "DEFROST=%s, hold=%s, cooldown=%s, rate_bad=%s, rate_source=%s, "
+        "icing_band=%s, band_upper=%.0f%%, min_floor=%.0f%%, theta=%s | "
         "SP=%.2f, step_limit=%.1f, deadband=%.2f | "
         "prev=%s → opt≈%.0f%% → target≈%.0f%% → clip=%.0f%% → select=%s",
         unit_name, ctx, Tin, Tout_raw, Tout_bucket, Tout_future,
-        str(defrosting), cool_str, str(rate_bad),
-        icing_str, band_upper, theta_str,
+        str(defrosting), str(hold_active), cool_str, str(rate_bad), str(rate_source),
+        icing_str, band_upper, min_floor, theta_str,
         sp, step_limit, deadband,
         prev_str, dem_opt, dem_target, dem_clip, option,
     )
@@ -725,6 +1604,8 @@ def daikin_ml_step():
 def daikin_ml_reset():
     """Nollaa kaikkien laitteiden ML-opit ja aloita alusta."""
     global _theta_by_unit_ctx, _P_by_unit_ctx, _params_loaded, _last_defrosting, _cooldown_until
+    global _prev_err, _last_demand_change_ts, _last_demand_sig, _tin_hist
+    global _hold_until, _held_select_option, _held_quiet_on
 
     for u in DAIKINS:
         unit_name = u["name"]
@@ -736,6 +1617,16 @@ def daikin_ml_reset():
         _params_loaded[unit_name] = False
         _last_defrosting[unit_name] = None
         _cooldown_until[unit_name] = 0.0
+        _prev_err[unit_name] = None
+
+        _last_demand_change_ts[unit_name] = 0.0
+        _last_demand_sig[unit_name] = None
+
+        _tin_hist[unit_name] = []
+
+        _hold_until[unit_name] = 0.0
+        _held_select_option[unit_name] = None
+        _held_quiet_on[unit_name] = None
 
         try:
             state.set(
