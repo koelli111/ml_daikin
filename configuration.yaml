@@ -198,7 +198,6 @@ input_number:
     step: 5
     mode: slider
     unit_of_measurement: "s"
-    initial: 60
 
 template:
 
