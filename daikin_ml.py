@@ -48,25 +48,30 @@ DAIKINS = [
 
         # ------------------------------------------------------------
         # Minimum demand floors by outdoor temperature band
-        # (Hard floor enforced regardless of setpoint vs indoor temp)
-        # Bands are in whole-degree buckets (int(round(Tout_raw))).
         # ------------------------------------------------------------
         "MIN_DEM_FLOOR_M05_M10": "input_number.daikin1_min_dem_m05_m10",  # -5 .. -10
         "MIN_DEM_FLOOR_M11_M15": "input_number.daikin1_min_dem_m11_m15",  # -11 .. -15
         "MIN_DEM_FLOOR_LE_M16":  "input_number.daikin1_min_dem_le_m16",   # <= -16
 
         # ------------------------------------------------------------
-        # NEW: Maximum demand caps by outdoor temperature band
-        # (Hard cap enforced regardless of setpoint vs indoor temp)
+        # Maximum demand caps by outdoor temperature band
         # ------------------------------------------------------------
         "MAX_DEM_CAP_M05_M10": "input_number.daikin1_max_dem_m05_m10",  # -5 .. -10
         "MAX_DEM_CAP_M11_M15": "input_number.daikin1_max_dem_m11_m15",  # -11 .. -15
         "MAX_DEM_CAP_LE_M16":  "input_number.daikin1_max_dem_le_m16",   # <= -16
 
         # ------------------------------------------------------------
-        # NEW: Per-unit minimum interval between *applied* demand changes (seconds)
+        # Per-unit minimum interval between *applied* demand changes (seconds)
         # ------------------------------------------------------------
         "DEMAND_CHANGE_MIN_INTERVAL_HELPER": "input_number.daikin1_demand_change_min_interval_s",
+
+        # ------------------------------------------------------------
+        # NEW: Post-defrost behavior helpers (per unit)
+        # - Demand % to hold after defrost ends
+        # - Minutes to hold (during this time demand is NOT changed)
+        # ------------------------------------------------------------
+        "POST_DEFROST_DEMAND_HELPER": "input_number.daikin1_post_defrost_demand_pct",
+        "POST_DEFROST_HOLD_MINUTES_HELPER": "input_number.daikin1_post_defrost_hold_minutes",
     },
 
     # Esimerkki toisesta laitteesta (muuta entityt):
@@ -100,6 +105,9 @@ DAIKINS = [
     #     "MAX_DEM_CAP_LE_M16":  "input_number.daikin2_max_dem_le_m16",
     #
     #     "DEMAND_CHANGE_MIN_INTERVAL_HELPER": "input_number.daikin2_demand_change_min_interval_s",
+    #
+    #     "POST_DEFROST_DEMAND_HELPER": "input_number.daikin2_post_defrost_demand_pct",
+    #     "POST_DEFROST_HOLD_MINUTES_HELPER": "input_number.daikin2_post_defrost_hold_minutes",
     # },
 ]
 
@@ -152,13 +160,13 @@ EFF_TRIM_STEP = 2.0         # demand-% per tick inside deadband
 EFF_TRIM_STEP_FAST = 5.0    # demand-% per tick when above setpoint (err < 0)
 
 # ------------------------------------------------------------
-# NEW: Default minimum interval between applied demand changes (seconds)
+# Default minimum interval between applied demand changes (seconds)
 # This is overridden per-unit by DEMAND_CHANGE_MIN_INTERVAL_HELPER if present.
 # ------------------------------------------------------------
 DEMAND_CHANGE_MIN_INTERVAL_DEFAULT_S = 60.0
 
 # ------------------------------------------------------------
-# NEW: Learning uses smoothed 5-minute slope of indoor temperature
+# Learning uses smoothed 5-minute slope of indoor temperature
 # - Keeps a per-unit history of (timestamp, Tin)
 # - If not enough history/span, falls back to the derivative sensor
 # ------------------------------------------------------------
@@ -169,11 +177,14 @@ TIN_SLOPE_MIN_SAMPLES = 3        # require a few points for smoothing/robustness
 # ------------------------------------------------------------
 # Defrost hold behavior
 # - Freeze to pre-defrost demand during defrost
-# - Keep same demand for 5 minutes after defrost ends
-# - Do not collect/use Tin measurements until hold period ends
+# - Keep same demand for N minutes after defrost ends (user selectable)
+# - During hold: do not collect/use Tin measurements
 # ------------------------------------------------------------
 DEFROST_LIQUID_THRESHOLD = 20.0
-POST_DEFROST_HOLD_S = 5 * 60.0
+
+# DEFAULTS (used if helpers missing)
+POST_DEFROST_HOLD_DEFAULT_MIN = 5.0           # minutes
+POST_DEFROST_DEMAND_DEFAULT_PCT = 60.0        # %
 
 # ============================================================
 # Nordpool -> Setpoint integration
@@ -507,6 +518,37 @@ def _demand_change_min_interval_s(u):
     # clamp to something sane: 0..600s
     return _clip(v, 0.0, 600.0)
 
+# ------------------------------------------------------------
+# NEW: post-defrost demand + hold minutes (helpers)
+# ------------------------------------------------------------
+def _post_defrost_hold_s(u):
+    ent = u.get("POST_DEFROST_HOLD_MINUTES_HELPER")
+    if ent:
+        minutes = _read_float_entity(ent, POST_DEFROST_HOLD_DEFAULT_MIN)
+    else:
+        minutes = POST_DEFROST_HOLD_DEFAULT_MIN
+    minutes = _clip(minutes, 0.0, 120.0)  # 0..120 min
+    return float(minutes) * 60.0
+
+def _post_defrost_demand_pct(u):
+    ent = u.get("POST_DEFROST_DEMAND_HELPER")
+    if ent:
+        pct = _read_float_entity(ent, POST_DEFROST_DEMAND_DEFAULT_PCT)
+    else:
+        pct = POST_DEFROST_DEMAND_DEFAULT_PCT
+    return _clip(pct, 0.0, 100.0)
+
+def _compute_post_defrost_hold_option_and_quiet(u, select_entity, unit_has_quiet):
+    """
+    Returns (held_select_option_str, held_quiet_bool_or_none)
+    """
+    pct = float(_post_defrost_demand_pct(u))
+    opt = _snap_to_select(select_entity, pct, 0)
+    if unit_has_quiet:
+        # During post-defrost hold, keep quiet ON always (safe + prevents 105 layer antics)
+        return opt, True
+    return opt, None
+
 
 # ============================================================
 # Nordpool avg window dynamic update (based on hourly forecast)
@@ -610,7 +652,7 @@ _last_demand_sig       = {}  # unit -> signature tuple
 # per-unit Tin history for 5-minute smoothed slope
 _tin_hist = {}  # unit -> list[(ts, Tin)]
 
-# Hold demand through defrost and for 5 minutes after defrost ends
+# Hold demand through defrost and for N minutes after defrost ends
 _hold_until = {}          # unit -> epoch float (0 if inactive)
 _held_select_option = {}  # unit -> string option, e.g. "70%" (or "70")
 _held_quiet_on = {}       # unit -> bool/None
@@ -976,9 +1018,6 @@ def _run_one_unit(u):
 
     now = time.time()
 
-
-    # Tin history is appended only when not defrosting and not in post-defrost hold.
-
     # ------------------------------------------------------------
     # NEW: Learning rate uses smoothed 5-minute Tin slope.
     # If not enough history yet, fall back to the derivative sensor.
@@ -1091,12 +1130,11 @@ def _run_one_unit(u):
     if isfinite(prev_base) and prev_base >= 100.0 - 1e-6 and (quiet_on is False):
         prev = unit_max_dem
 
-
     # ------------------------------------------------------------
     # Defrost + post-defrost hold behavior:
-    # - Freeze to the pre-defrost demand during defrost
-    # - Keep same demand for 5 minutes after defrost ends
-    # - Do not collect/use Tin measurements until hold period ends
+    # - Defrostin aikana: pidä pre-defrost demand
+    # - Defrostin jälkeen: pidä käyttäjän valitsemaa demandia N minuuttia
+    # - Älä kerää/käytä Tin-mittauksia holdin aikana
     # ------------------------------------------------------------
     try:
         liquid = float(state.get(LIQUID) or 100.0)
@@ -1117,25 +1155,34 @@ def _run_one_unit(u):
         _hold_until[unit_name] = 0.0
         _tin_hist[unit_name] = []
         log.info(
-            "Daikin ML (%s): entering defrost -> holding demand select=%s quiet=%s",
+            "Daikin ML (%s): entering defrost -> holding pre-defrost select=%s quiet=%s",
             unit_name, str(_held_select_option[unit_name]), str(_held_quiet_on[unit_name])
         )
 
-    # Exiting defrost: start cooldown as before + start 5-minute hold
+    # Exiting defrost: start cooldown as before + start user-configurable hold (demand + minutes)
     if (_last_defrosting[unit_name] is True) and (defrosting is False):
         _cooldown_until[unit_name] = now + COOLDOWN_MINUTES * 60.0
-        _hold_until[unit_name] = now + POST_DEFROST_HOLD_S
+
+        hold_s = float(_post_defrost_hold_s(u))
+        _hold_until[unit_name] = now + hold_s
+
+        # Set post-defrost held demand from helper (instead of pre-defrost)
+        held_opt, held_quiet = _compute_post_defrost_hold_option_and_quiet(u, SELECT, unit_has_quiet)
+        _held_select_option[unit_name] = held_opt
+        _held_quiet_on[unit_name] = held_quiet
+
         _tin_hist[unit_name] = []
         log.info(
-            "Daikin ML (%s): defrost ended -> cooldown %d min, holding pre-defrost demand for %.0f s",
-            unit_name, COOLDOWN_MINUTES, float(POST_DEFROST_HOLD_S)
+            "Daikin ML (%s): defrost ended -> cooldown %d min, post-defrost hold %.0f s, holding select=%s quiet=%s",
+            unit_name, COOLDOWN_MINUTES, float(hold_s),
+            str(_held_select_option[unit_name]), str(_held_quiet_on[unit_name])
         )
 
     _last_defrosting[unit_name] = defrosting
     hold_active = (now < float(_hold_until.get(unit_name) or 0.0))
     in_cooldown = (now < _cooldown_until[unit_name])
 
-    # During defrost or hold: enforce held demand and skip using Tin measurements
+    # During defrost or post-defrost hold: enforce held demand and skip using Tin measurements
     if defrosting or hold_active:
         held_opt = _held_select_option.get(unit_name) or prev_str
         held_quiet = _held_quiet_on.get(unit_name) if unit_has_quiet else None
@@ -1160,7 +1207,7 @@ def _run_one_unit(u):
             except Exception:
                 pass
 
-        # Publish learned demand as held (cron-only publishing already)
+        # Publish learned demand as held
         try:
             held_num = float(str(held_opt).replace('%', '')) if held_opt else float(prev_base)
         except Exception:
