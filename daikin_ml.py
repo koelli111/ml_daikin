@@ -2,25 +2,14 @@
 # Daikin demand-select controller with online learning (RLS) + discrete MPC action selection.
 # MULTI-DAIKIN support.
 #
-# Version: 2026-01-09 (ML v4 + Power map + Heating curve + Empirical Sustain Curve)
+# Version: 2026-01-08 (ML v2) + FIXPACK A
 #
-# Key upgrades vs previous version:
-#  - FIXED: Correct RLS covariance update (previous version used an incorrect P update).
-#  - More robust online learning: outlier gating, skip learning immediately after demand changes.
-#  - Coarser configurable outdoor-context bucketing + nearest-context initialization (faster learning transfer).
-#  - Persistent store now includes model version, feature names, theta_by_ctx, Pdiag_by_ctx, residual stats.
-#  - Discrete MPC-style action selection over actual select options (+ optional 105 "layer" via quiet switch).
-#  - Optional setpoint source mode: manual setpoint vs (base + Nordpool bias).
-#  - Optional extra sensors as additional exogenous ML features (per unit).
-#  - NEW: Learns non-linear Demand→Power mapping from sensor.daikin_p40_power (fallback: sensor.faikin_power_consumption).
-#  - NEW: Publishes sensor.<unit>_ml_heating_curve (attributes.curve_points) for Plotly heating-curve visualization.
-#  - NEW (THIS CHANGE): Heating curve now prefers empirically learned "sustaining demand" per outdoor ctx,
-#    so curve updates when ML observes steady holding behavior.
-#
-# FIX (2026-01-09):
-#  - Cron full-control is now scheduled by time (every CONTROL_DT_S) AND also triggered if outdoor bucket changes.
-#    This prevents getting stuck in mpc_preview refresh loops when the outdoor bucket is stable.
-#  - MPC rate_prev is now updated even on derivative_fallback (control-only), so MPC reacts to cooling trends.
+# Fixpack A changes:
+#  - FIX: Refresh/publish demand + ALL attributes when INDOOR temperature changes:
+#         state_trigger now runs full _run_one_unit() for the triggering unit.
+#  - FIX: mpc_cost is NEVER None/NaN anymore (HA shows "Tuntematon" for None/NaN).
+#         It is always a finite float (0.0 when MPC not used), and publish is bulletproof.
+#  - FIX: hold/defrost publish also includes mpc_cost/mpc_dbg so UI never shows unknown.
 
 import time
 from math import isfinite, sqrt
@@ -39,11 +28,6 @@ DAIKINS = [
 
         "SELECT": "select.faikin_demand_control",
         "LIQUID": "sensor.faikin_liquid",
-
-        # Power consumption meter (preferred) + fallback (rough estimation)
-        # Used to learn non-linear Demand -> Power mapping.
-        "POWER_SENSOR": "sensor.daikin_p40_power",
-        "POWER_SENSOR_FALLBACK": "sensor.faikin_power_consumption",
 
         # Quiet outdoor mode switch (Faikin)
         "QUIET_OUTDOOR_SWITCH": "switch.faikin_quiet_outdoor",
@@ -80,40 +64,26 @@ DAIKINS = [
         # Learned-demand sensor per device
         "LEARNED_SENSOR": "sensor.daikin1_ml_learned_demand",
 
-        # ------------------------------------------------------------
-        # Optional: outdoor-context bucket width in °C (coarser => more transfer, fewer contexts)
-        #   e.g. 1.0=per-degree, 2.0=every 2°C, 3.0=every 3°C
-        # ------------------------------------------------------------
+        # Optional: outdoor-context bucket width in °C
         "CTX_BIN_C": 1.0,
 
-        # ------------------------------------------------------------
         # Optional: additional ML features (exogenous sensors)
-        # Each item is mapped to a normalized feature ~[-1..+1] by (value-mid)/half_range.
-        # ------------------------------------------------------------
         "EXTRA_FEATURES": [],
 
-        # ------------------------------------------------------------
         # Minimum demand floors by outdoor temperature band
-        # ------------------------------------------------------------
         "MIN_DEM_FLOOR_M05_M10": "input_number.daikin1_min_dem_m05_m10",  # -5 .. -10
         "MIN_DEM_FLOOR_M11_M15": "input_number.daikin1_min_dem_m11_m15",  # -11 .. -15
         "MIN_DEM_FLOOR_LE_M16":  "input_number.daikin1_min_dem_le_m16",   # <= -16
 
-        # ------------------------------------------------------------
         # Maximum demand caps by outdoor temperature band
-        # ------------------------------------------------------------
         "MAX_DEM_CAP_M05_M10": "input_number.daikin1_max_dem_m05_m10",  # -5 .. -10
         "MAX_DEM_CAP_M11_M15": "input_number.daikin1_max_dem_m11_m15",  # -11 .. -15
         "MAX_DEM_CAP_LE_M16":  "input_number.daikin1_max_dem_le_m16",   # <= -16
 
-        # ------------------------------------------------------------
         # Per-unit minimum interval between *applied* demand changes (seconds)
-        # ------------------------------------------------------------
         "DEMAND_CHANGE_MIN_INTERVAL_HELPER": "input_number.daikin1_demand_change_min_interval_s",
 
-        # ------------------------------------------------------------
         # Post-defrost behavior helpers (per unit)
-        # ------------------------------------------------------------
         "POST_DEFROST_DEMAND_HELPER": "input_number.daikin1_post_defrost_demand_pct",
         "POST_DEFROST_HOLD_MINUTES_HELPER": "input_number.daikin1_post_defrost_hold_minutes",
     },
@@ -123,39 +93,29 @@ DAIKINS = [
 # 2) SHARED CONTROL CONSTANTS
 # ============================================================
 
-# Controller cadence (cron): TRUE 5-minute cadence
 CONTROL_DT_S = 5 * 60.0
 CONTROL_DT_H = CONTROL_DT_S / 3600.0
 
-# Online learning (RLS)
-MODEL_VERSION = 3
+MODEL_VERSION = 2
 
 LAMBDA = 0.995
 P0 = 1e4
 
-# Hard demand clamps
 MIN_DEM = 30.0
 MAX_DEM = 100.0
 
-# Quiet-switch extra "layer" at max demand:
-#  - Demand 100 with quiet_outdoor ON  => effective demand 100
-#  - Demand 100 with quiet_outdoor OFF => effective demand 105
 MAX_DEM_LAYER = 105.0
-QUIET_LAYER_EXTRA = 5.0  # fixed layer (binary), kept for backwards naming
+QUIET_LAYER_EXTRA = 5.0
 
-# Global "mild weather" max
 GLOBAL_MILD_MAX = 95.0
 
-# Cooldown after defrost
-COOLDOWN_MINUTES = 5
+COOLDOWN_MINUTES = 15
 COOLDOWN_STEP_UP = 3.0
 
-# Icing band cap
 ICING_BAND_MIN = -2.0
 ICING_BAND_MAX = 4.0
 ICING_BAND_CAP_DEFAULT = 80.0
 
-# Auto step/deadband tuning (internal only, does NOT overwrite helpers)
 AUTO_STEP_MIN = 3.0
 AUTO_STEP_MAX = 20.0
 AUTO_STEP_BASE = 10.0
@@ -164,102 +124,55 @@ AUTO_DB_MIN = 0.05
 AUTO_DB_MAX = 0.50
 AUTO_DB_BASE = 0.10
 
-# Soft landing near setpoint
 SOFT_ERR_START = 0.2
 SOFT_ERR_END = 0.0
 SOFT_STEP_MIN = 1.0
 SOFT_APPROACH_EPS = 0.01
 
-# Efficiency behavior inside deadband
 EFF_TRIM_STEP = 2.0
 EFF_TRIM_STEP_FAST = 5.0
 
-# Default min interval between applied demand changes (seconds)
 DEMAND_CHANGE_MIN_INTERVAL_DEFAULT_S = 60.0
 
-# Indoor temperature slope estimation
 TIN_SLOPE_WINDOW_S = 5 * 60.0
 TIN_SLOPE_MIN_SPAN_S = 4 * 60.0
 TIN_SLOPE_MIN_SAMPLES = 3
 
-# Defrost detection
 DEFROST_LIQUID_THRESHOLD = 20.0
 POST_DEFROST_HOLD_DEFAULT_MIN = 5.0
 POST_DEFROST_DEMAND_DEFAULT_PCT = 60.0
 
-# ------------------------------------------------------------
-# ML feature scaling (keep features in similar numeric ranges)
-# ------------------------------------------------------------
 ERR_SCALE = 2.0
 DELTA_SCALE = 10.0
 RATE_SCALE = 2.0
 TOUT_SCALE = 10.0
 
-# Rate prediction clamp (degC/h) to avoid insane model outputs destabilizing MPC
 PRED_RATE_CLIP = 3.0
 
-# ------------------------------------------------------------
-# Power learning: non-linear mapping Demand -> electrical power (W)
-# ------------------------------------------------------------
-POWER_SENSOR_DEFAULT = "sensor.daikin_p40_power"
-POWER_SENSOR_FALLBACK_DEFAULT = "sensor.faikin_power_consumption"
-
-POWER_VALID_W_MIN = 0.0
-POWER_VALID_W_MAX = 8000.0
-POWER_ACTIVE_MIN_W = 50.0  # don't learn from near-zero/off readings
-
-POWER_EWMA_ALPHA = 0.15
-POWER_LEARN_SKIP_AFTER_DEMAND_CHANGE_S = 180.0  # allow power to settle after demand change
-
-# Feature scaling for predicted power (W)
-PWR_SCALE_W = 2000.0
-
-# ------------------------------------------------------------
-# Heating-curve sensor publication (learned sustaining demand vs outdoor temp)
-# ------------------------------------------------------------
-HEATING_CURVE_OUT_MIN_C = -25
-HEATING_CURVE_OUT_MAX_C = 10
-HEATING_CURVE_STEP_C = 1
-HEATING_CURVE_MIN_UPDATE_INTERVAL_S = 60.0  # throttle curve updates during rapid sensor changes
-
-# ------------------------------------------------------------
-# Empirical sustaining-demand learning (for heating curve)
-#   Learns: for each outdoor ctx, what effective demand actually holds temp
-# ------------------------------------------------------------
-SUSTAIN_EWMA_ALPHA = 0.20        # how fast the curve adapts
-SUSTAIN_RATE_ABS_MAX = 0.25      # degC/h: "near steady"
-SUSTAIN_MIN_SINCE_CHANGE_S = 300 # seconds stable after demand change before learning sustain
-
-# Learning gating:
-LEARN_SKIP_AFTER_DEMAND_CHANGE_S = 120.0  # don't update immediately after changing demand
-LEARN_MIN_UPDATES_FOR_OUTLIER_GATE = 10   # start outlier gating after some updates
+LEARN_SKIP_AFTER_DEMAND_CHANGE_S = 120.0
+LEARN_MIN_UPDATES_FOR_OUTLIER_GATE = 10
 RESID_EWMA_ALPHA = 0.10
 RESID_GATE_K = 4.0
-RESID_GATE_ABS_MIN = 0.60  # degC/h (always gate truly crazy points)
+RESID_GATE_ABS_MIN = 0.60
 
-# Parameter projection constraints (physics-informed):
-THETA_DEMAND_MIN = 0.10   # demand coefficient lower bound
-THETA_DEMAND_MAX = 20.0   # upper bound (scaled units)
-THETA_LOSS_MIN = 0.00     # heat loss coefficient should be >= 0
+THETA_DEMAND_MIN = 0.10
+THETA_DEMAND_MAX = 20.0
+THETA_LOSS_MIN = 0.00
 THETA_LOSS_MAX = 20.0
-THETA_INT_MIN = 0.00      # demand*Tout interaction coefficient >= 0
+THETA_INT_MIN = 0.00
 THETA_INT_MAX = 20.0
 THETA_RATEPREV_MIN = -1.0
 THETA_RATEPREV_MAX = 1.5
-THETA_PWR_MIN = 0.00
-THETA_PWR_MAX = 20.0
 
-# MPC parameters (discrete action selection)
 HORIZON_H = 1.0
-MPC_STEPS = max(1, int(round(HORIZON_H / CONTROL_DT_H)))  # ~12 steps for 1 hour
+MPC_STEPS = max(1, int(round(HORIZON_H / CONTROL_DT_H)))
 MPC_W_ERR = 1.0
 MPC_W_OVERSHOOT = 2.0
 MPC_W_ENERGY = 0.10
 MPC_W_CHANGE = 0.02
 
-# If model has too few updates, fall back to a safe PI-like heuristic.
 MIN_UPDATES_FOR_MPC = 20
-PI_KP_PCT_PER_C = 15.0   # % demand per °C error (step limit still applies)
+PI_KP_PCT_PER_C = 15.0
 
 # ============================================================
 # 3) NORDPOOL -> SETPOINT INTEGRATION
@@ -357,8 +270,6 @@ def _rls_update(theta, P, x, y, lam=LAMBDA):
     Correct RLS update:
       K = P x / (lam + x^T P x)
       theta <- theta + K * (y - x^T theta)
-      P <- (P - K (x^T P)) / lam
-    With symmetric P, x^T P is (P x)^T, so:
       P <- (P - outer(K, Px)) / lam
     Returns (theta_new, P_new, did_update_bool, residual)
     """
@@ -400,7 +311,6 @@ def _rls_update(theta, P, x, y, lam=LAMBDA):
 
     _symmetrize(P_new)
 
-    # Basic sanity on diagonals
     for i in range(n):
         if (not isfinite(P_new[i][i])) or (P_new[i][i] <= 1e-9) or (P_new[i][i] > 1e12):
             return theta, P, False, resid
@@ -470,7 +380,6 @@ def _snap_to_select(select_entity, value, direction):
     return str(picked) + ('%' if has_pct else '')
 
 def _auto_tune_helpers(theta, unit_name, ctx, step_limit_current, deadband_current):
-    # Use demand coefficient magnitude as "gain proxy".
     try:
         gain = abs(float(theta[2]))
     except Exception:
@@ -510,16 +419,11 @@ def _ctx_key_for_outdoor(Tout: float, bin_c: float) -> str:
         return "global"
     bucket = int(round(Tout / bc))
     key = bucket * bc
-    # make nice string keys, avoid "2.0" if integer
     if abs(key - round(key)) < 1e-6:
         return str(int(round(key)))
     return str(round(key, 2))
 
 def _nearest_existing_ctx(theta_by_ctx, ctx_key, bin_c):
-    """
-    When entering a new context (outdoor bucket), initialize theta from nearest existing context
-    to speed up learning transfer.
-    """
     try:
         target = float(ctx_key)
     except Exception:
@@ -535,7 +439,6 @@ def _nearest_existing_ctx(theta_by_ctx, ctx_key, bin_c):
         if best_dist is None or d < best_dist:
             best_dist = d
             best_key = k
-    # accept only reasonably close contexts
     if best_key is None:
         return None
     try:
@@ -547,236 +450,6 @@ def _nearest_existing_ctx(theta_by_ctx, ctx_key, bin_c):
     if best_dist is not None and best_dist <= (2.0 * bc + 1e-6):
         return best_key
     return None
-
-# ------------------------------------------------------------
-# Power sensor read + Demand -> Power (W) mapping (EWMA)
-# ------------------------------------------------------------
-
-def _read_power_w_entity(entity_id):
-    """Read a power sensor entity and return float(W) if available, else None."""
-    if not entity_id:
-        return None
-    try:
-        v = state.get(entity_id)
-    except Exception:
-        return None
-    if v is None:
-        return None
-    s = str(v).strip().lower()
-    if s in ("unknown", "unavailable", "none", ""):
-        return None
-    try:
-        p = float(str(v))
-    except Exception:
-        return None
-    if not isfinite(p):
-        return None
-    return p
-
-def _read_power_w_for_unit(u):
-    """
-    Preferred: u['POWER_SENSOR'] (default: POWER_SENSOR_DEFAULT)
-    Fallback:  u['POWER_SENSOR_FALLBACK'] (default: POWER_SENSOR_FALLBACK_DEFAULT)
-    Returns (power_w, source, entity_id) where power_w is float or None.
-    """
-    ent1 = u.get("POWER_SENSOR") or POWER_SENSOR_DEFAULT
-    ent2 = u.get("POWER_SENSOR_FALLBACK") or POWER_SENSOR_FALLBACK_DEFAULT
-
-    p1 = _read_power_w_entity(ent1)
-    if p1 is not None:
-        return float(p1), "primary", ent1
-
-    p2 = _read_power_w_entity(ent2)
-    if p2 is not None:
-        return float(p2), "fallback", ent2
-
-    return None, "none", None
-
-def _demand_key(eff):
-    try:
-        v = float(eff)
-    except Exception:
-        v = 0.0
-    if not isfinite(v):
-        v = 0.0
-    if abs(v - round(v)) < 1e-6:
-        return str(int(round(v)))
-    return str(round(v, 1))
-
-def _power_map_get(unit_name, ctx):
-    d = _power_w_by_unit_ctx.get(unit_name)
-    if not isinstance(d, dict):
-        return None
-    m = d.get(str(ctx))
-    return m if isinstance(m, dict) else None
-
-def _power_map_get_n(unit_name, ctx):
-    d = _power_n_by_unit_ctx.get(unit_name)
-    if not isinstance(d, dict):
-        return None
-    m = d.get(str(ctx))
-    return m if isinstance(m, dict) else None
-
-def _power_map_update(unit_name, ctx, eff, power_w):
-    """EWMA update for demand->power mapping. Updates both ctx and 'global'."""
-    if unit_name not in _power_w_by_unit_ctx:
-        _power_w_by_unit_ctx[unit_name] = {}
-    if unit_name not in _power_n_by_unit_ctx:
-        _power_n_by_unit_ctx[unit_name] = {}
-
-    key = _demand_key(eff)
-    p = _clip(power_w, POWER_VALID_W_MIN, POWER_VALID_W_MAX)
-
-    for ctx_k in (str(ctx), "global"):
-        m = _power_w_by_unit_ctx[unit_name].get(ctx_k)
-        nmap = _power_n_by_unit_ctx[unit_name].get(ctx_k)
-        if not isinstance(m, dict):
-            m = {}
-            _power_w_by_unit_ctx[unit_name][ctx_k] = m
-        if not isinstance(nmap, dict):
-            nmap = {}
-            _power_n_by_unit_ctx[unit_name][ctx_k] = nmap
-
-        if key not in m:
-            m[key] = float(p)
-            nmap[key] = int(nmap.get(key, 0)) + 1
-        else:
-            prev = float(m.get(key) or p)
-            m[key] = (1.0 - POWER_EWMA_ALPHA) * prev + POWER_EWMA_ALPHA * float(p)
-            nmap[key] = int(nmap.get(key, 0)) + 1
-
-def _power_estimate_w(unit_name, ctx, eff):
-    """Estimate power draw (W) for a given effective demand in a given ctx."""
-    key = _demand_key(eff)
-
-    # 1) Exact ctx match
-    m = _power_map_get(unit_name, ctx)
-    if isinstance(m, dict):
-        v = m.get(key)
-        if v is not None:
-            try:
-                vf = float(v)
-                if isfinite(vf):
-                    return _clip(vf, POWER_VALID_W_MIN, POWER_VALID_W_MAX)
-            except Exception:
-                pass
-
-        # 1b) Interpolate within this ctx if possible
-        try:
-            ks = []
-            for k in m.keys():
-                try:
-                    ks.append(float(k))
-                except Exception:
-                    pass
-            ks = sorted(set(ks))
-            if len(ks) >= 2:
-                x = float(eff)
-                lo = None
-                hi = None
-                for n in ks:
-                    if n <= x:
-                        lo = n
-                    if n >= x and hi is None:
-                        hi = n
-                if lo is None:
-                    lo = ks[0]
-                if hi is None:
-                    hi = ks[-1]
-                if abs(hi - lo) < 1e-9:
-                    return _clip(float(m.get(_demand_key(lo)) or 0.0), POWER_VALID_W_MIN, POWER_VALID_W_MAX)
-                vlo = float(m.get(_demand_key(lo)) or 0.0)
-                vhi = float(m.get(_demand_key(hi)) or 0.0)
-                frac = (x - lo) / (hi - lo)
-                est = vlo + frac * (vhi - vlo)
-                if isfinite(est):
-                    return _clip(est, POWER_VALID_W_MIN, POWER_VALID_W_MAX)
-        except Exception:
-            pass
-
-    # 2) Nearest ctx transfer
-    unit_map = _power_w_by_unit_ctx.get(unit_name) or {}
-    if isinstance(unit_map, dict) and unit_map:
-        nearest = _nearest_existing_ctx(unit_map, str(ctx), 0.0)  # accept any
-        if nearest and nearest in unit_map:
-            m2 = unit_map.get(nearest)
-            if isinstance(m2, dict):
-                v = m2.get(key)
-                if v is not None:
-                    try:
-                        vf = float(v)
-                        if isfinite(vf):
-                            return _clip(vf, POWER_VALID_W_MIN, POWER_VALID_W_MAX)
-                    except Exception:
-                        pass
-
-    # 3) Global context
-    m3 = _power_map_get(unit_name, "global")
-    if isinstance(m3, dict):
-        v = m3.get(key)
-        if v is not None:
-            try:
-                vf = float(v)
-                if isfinite(vf):
-                    return _clip(vf, POWER_VALID_W_MIN, POWER_VALID_W_MAX)
-            except Exception:
-                pass
-
-    # 4) Scale from last measurement if available
-    lp = _last_power_w.get(unit_name)
-    le = _last_power_eff.get(unit_name)
-    try:
-        lp = float(lp) if lp is not None else None
-        le = float(le) if le is not None else None
-    except Exception:
-        lp = None
-        le = None
-
-    if lp is not None and le is not None and isfinite(lp) and isfinite(le) and le > 1e-6:
-        est = lp * (float(eff) / le)
-        if isfinite(est):
-            return _clip(est, POWER_VALID_W_MIN, POWER_VALID_W_MAX)
-
-    # 5) Last resort: linear default (rough)
-    est = (float(_clip(eff, 0.0, MAX_DEM_LAYER)) / 100.0) * PWR_SCALE_W
-    return _clip(est, POWER_VALID_W_MIN, POWER_VALID_W_MAX)
-
-# ------------------------------------------------------------
-# Empirical sustaining-demand map update (EWMA)
-# ------------------------------------------------------------
-
-def _sustain_update(unit_name, ctx, eff):
-    """
-    EWMA update of sustaining effective demand for this outdoor context.
-    Stores per ctx: {"eff": <ewma>, "n": <samples>}
-    """
-    if unit_name not in _sustain_eff_by_unit_ctx:
-        _sustain_eff_by_unit_ctx[unit_name] = {}
-
-    m = _sustain_eff_by_unit_ctx[unit_name]
-    k = str(ctx)
-
-    try:
-        eff = float(eff)
-    except Exception:
-        return False
-    if not isfinite(eff):
-        return False
-
-    cur = m.get(k)
-    if not isinstance(cur, dict) or ("eff" not in cur):
-        m[k] = {"eff": float(eff), "n": 1}
-        return True
-
-    prev = float(cur.get("eff", eff))
-    try:
-        n = int(cur.get("n", 0)) + 1
-    except Exception:
-        n = 1
-
-    new_eff = (1.0 - SUSTAIN_EWMA_ALPHA) * prev + SUSTAIN_EWMA_ALPHA * float(eff)
-    m[k] = {"eff": float(new_eff), "n": int(max(1, n))}
-    return True
 
 # ------------------------------------------------------------
 # Outdoor forecast / Nordpool averaging window dynamic update
@@ -958,23 +631,16 @@ def _read_setpoint_mode(u):
     s = state.get(ent)
     if s is None:
         return "auto"
-    # input_boolean: on=auto, off=manual
     if s == "on":
         return "auto"
     if s == "off":
         return "manual"
-    # input_select: expect "auto"/"manual"
     s2 = str(s).strip().lower()
     if s2 in ("manual", "user"):
         return "manual"
     return "auto"
 
 def _compute_effective_setpoint(u):
-    """
-    Returns dict:
-      sp, sp_mode, sp_base, bias_points, sp_bias_degC, bias_enabled,
-      avg_window_h, avg_window_factor, sp_min_guard, sp_max_guard, wrote_sp_helper(bool)
-    """
     SP_HELPER = u["SP_HELPER"]
     SP_BASE_HELPER = u.get("SP_BASE_HELPER")
     PRICE_BIAS_HELPER = u.get("PRICE_BIAS_HELPER")
@@ -984,7 +650,6 @@ def _compute_effective_setpoint(u):
 
     sp_mode = _read_setpoint_mode(u)
 
-    # Guards
     try:
         sp_min_guard = float(state.get(MIN_TEMP_GUARD_HELPER) or MIN_GUARD_DEFAULT) if MIN_TEMP_GUARD_HELPER else MIN_GUARD_DEFAULT
     except Exception:
@@ -1005,7 +670,6 @@ def _compute_effective_setpoint(u):
     bias_points = 0.0
     sp_base = SP_BASE_DEFAULT
 
-    # Read base setpoint (auto only)
     if SP_BASE_HELPER:
         try:
             sp_base = float(state.get(SP_BASE_HELPER) or SP_BASE_DEFAULT)
@@ -1014,7 +678,6 @@ def _compute_effective_setpoint(u):
     if not isfinite(sp_base):
         sp_base = SP_BASE_DEFAULT
 
-    # Bias points (auto only)
     if bias_enabled and PRICE_BIAS_HELPER:
         try:
             bias_points = float(state.get(PRICE_BIAS_HELPER) or 0.0)
@@ -1023,7 +686,6 @@ def _compute_effective_setpoint(u):
         if not isfinite(bias_points):
             bias_points = 0.0
 
-    # Dynamic avg window factor (auto only)
     try:
         avg_window_h = float(state.get(NORDPOOL_AVG_WINDOW_HELPER) or AVG_WINDOW_REF_H)
     except Exception:
@@ -1037,7 +699,6 @@ def _compute_effective_setpoint(u):
     wrote = False
 
     if sp_mode == "manual":
-        # Manual mode: use SP_HELPER as user-set setpoint; do NOT overwrite it.
         try:
             sp = float(state.get(SP_HELPER) or sp_base)
         except Exception:
@@ -1059,7 +720,6 @@ def _compute_effective_setpoint(u):
             "wrote_sp_helper": False,
         }
 
-    # Auto mode: base + optional bias, then write effective into SP_HELPER
     sp = sp_base + (sp_bias_degC if bias_enabled else 0.0)
     sp = _clip(sp, sp_min_guard, sp_max_guard)
 
@@ -1107,7 +767,7 @@ def _normalized_extra_feature(val, vmin, vmax):
     half = 0.5 * (hi - lo)
     if half <= 1e-9:
         return 0.0
-    z = (v - mid) / half  # ~[-1..1]
+    z = (v - mid) / half
     return _clip(z, -3.0, 3.0)
 
 def _feature_names_for_unit(u):
@@ -1118,7 +778,6 @@ def _feature_names_for_unit(u):
         "delta",
         "rate_prev",
         "demand_tout",
-        "pwr",
     ]
     extras = u.get("EXTRA_FEATURES") or []
     if isinstance(extras, list):
@@ -1132,22 +791,9 @@ def _feature_names_for_unit(u):
     return names
 
 def _build_feature_vector(u, Tin, sp, Tout, demand_eff, rate_prev):
-    """
-    Build feature vector x for the model:
-      y = dTin/dt (degC/h) ~= dot(theta, x)
-
-    demand_eff is "effective demand layer" (0..105)
-    """
     err = float(sp - Tin)
     demand_norm = _clip(float(demand_eff) / 100.0, 0.0, 1.2)
     delta = float(Tout - Tin)
-
-    # Demand levels are not linear in real compressor power.
-    # Use the learned Demand -> Power map as an additional feature so the thermal model
-    # can represent non-linear demand "strength" more accurately.
-    ctx_pwr = _ctx_key_for_outdoor(float(Tout), u.get("CTX_BIN_C", 0.0))
-    pwr_est_w = _power_estimate_w(u.get("name", "unit"), ctx_pwr, demand_eff)
-    pwr_norm = _clip(float(pwr_est_w) / PWR_SCALE_W, 0.0, 4.0)
 
     x = [
         1.0,
@@ -1156,7 +802,6 @@ def _build_feature_vector(u, Tin, sp, Tout, demand_eff, rate_prev):
         delta / DELTA_SCALE,
         float(rate_prev) / RATE_SCALE,
         demand_norm * (float(Tout) / TOUT_SCALE),
-        pwr_norm,
     ]
 
     extras = u.get("EXTRA_FEATURES") or []
@@ -1177,15 +822,9 @@ def _build_feature_vector(u, Tin, sp, Tout, demand_eff, rate_prev):
     return x
 
 def _project_theta(theta, feature_names):
-    """
-    Apply simple physics-informed projection constraints.
-    This prevents the model from learning nonsensical signs that make control unstable.
-    """
     n = len(theta)
     out = theta[:]
 
-    # Indices for known base features:
-    # 0 bias, 1 err, 2 demand, 3 delta(loss), 4 rate_prev, 5 demand_tout
     if n >= 3:
         out[2] = _clip(out[2], THETA_DEMAND_MIN, THETA_DEMAND_MAX)
     if n >= 4:
@@ -1194,10 +833,7 @@ def _project_theta(theta, feature_names):
         out[4] = _clip(out[4], THETA_RATEPREV_MIN, THETA_RATEPREV_MAX)
     if n >= 6:
         out[5] = _clip(out[5], THETA_INT_MIN, THETA_INT_MAX)
-    if n >= 7:
-        out[6] = _clip(out[6], THETA_PWR_MIN, THETA_PWR_MAX)
 
-    # No constraints for extras by default
     return out
 
 def _predict_rate(theta, x):
@@ -1207,46 +843,30 @@ def _predict_rate(theta, x):
     return _clip(y_hat, -PRED_RATE_CLIP, PRED_RATE_CLIP)
 
 # ============================================================
-# 5) PER-UNIT STATE (theta/P + defrost cooldown + learning meta + Tin slope)
+# 5) PER-UNIT STATE
 # ============================================================
 
-_theta_by_unit_ctx = {}  # unit -> ctx -> theta[list]
-_P_by_unit_ctx = {}      # unit -> ctx -> P[list[list]]
-_meta_by_unit_ctx = {}   # unit -> ctx -> dict(resid_var, n_updates)
-_power_w_by_unit_ctx = {}   # unit -> ctx -> dict(demand_key -> ewma power W)
-_power_n_by_unit_ctx = {}   # unit -> ctx -> dict(demand_key -> n samples)
-_last_power_w = {}          # unit -> last measured power W
-_last_power_eff = {}        # unit -> eff at last power measurement
-_feature_names_by_unit = {}  # unit -> list[str]
-_params_loaded = {}      # unit -> bool
+_theta_by_unit_ctx = {}
+_P_by_unit_ctx = {}
+_meta_by_unit_ctx = {}
+_feature_names_by_unit = {}
+_params_loaded = {}
 
-# NEW: empirical sustaining demand by context (for heating curve)
-_sustain_eff_by_unit_ctx = {}  # unit -> ctx -> {"eff": float, "n": int}
+_last_defrosting = {}
+_cooldown_until = {}
 
-# FIX: full-control scheduling by time + outdoor bucket-change
-_last_full_control_ts = {}   # unit -> epoch seconds of last full control
-_last_outdoor_bucket = {}    # unit -> last seen outdoor bucket for "run-now" trigger
+_prev_err = {}
+_last_rate = {}
 
-_last_curve_update_ts = {}  # unit -> epoch float of last heating-curve sensor publication
+_last_demand_change_ts = {}
+_last_demand_sig = {}
 
-_last_defrosting = {}    # unit -> bool/None
-_cooldown_until = {}     # unit -> epoch float
+_tin_hist = {}
 
-_prev_err = {}           # unit -> float/None
-_last_rate = {}          # unit -> last measured rate used for MPC (degC/h)
+_hold_until = {}
+_held_select_option = {}
+_held_quiet_on = {}
 
-_last_demand_change_ts = {}  # unit -> epoch float of last applied change
-_last_demand_sig = {}        # unit -> signature tuple
-
-_tin_hist = {}           # unit -> list[(ts, Tin)]
-
-_hold_until = {}         # unit -> epoch float
-_held_select_option = {} # unit -> option str
-_held_quiet_on = {}      # unit -> bool/None
-
-# ------------------------------------------------------------
-# Persistent store utilities
-# ------------------------------------------------------------
 def _persist_all_stores():
     for u in DAIKINS:
         try:
@@ -1261,31 +881,10 @@ def _init_unit_if_needed(unit_name):
         _P_by_unit_ctx[unit_name] = {}
     if unit_name not in _meta_by_unit_ctx:
         _meta_by_unit_ctx[unit_name] = {}
-    if unit_name not in _power_w_by_unit_ctx:
-        _power_w_by_unit_ctx[unit_name] = {}
-    if unit_name not in _power_n_by_unit_ctx:
-        _power_n_by_unit_ctx[unit_name] = {}
-    if unit_name not in _last_power_w:
-        _last_power_w[unit_name] = None
-    if unit_name not in _last_power_eff:
-        _last_power_eff[unit_name] = None
     if unit_name not in _feature_names_by_unit:
         _feature_names_by_unit[unit_name] = []
     if unit_name not in _params_loaded:
         _params_loaded[unit_name] = False
-
-    # NEW: sustain map init
-    if unit_name not in _sustain_eff_by_unit_ctx:
-        _sustain_eff_by_unit_ctx[unit_name] = {}
-
-    # FIX: init scheduler state
-    if unit_name not in _last_full_control_ts:
-        _last_full_control_ts[unit_name] = 0.0
-    if unit_name not in _last_outdoor_bucket:
-        _last_outdoor_bucket[unit_name] = None
-
-    if unit_name not in _last_curve_update_ts:
-        _last_curve_update_ts[unit_name] = 0.0
     if unit_name not in _last_defrosting:
         _last_defrosting[unit_name] = None
     if unit_name not in _cooldown_until:
@@ -1319,19 +918,11 @@ def _load_params_from_store(unit, feature_names_new):
     resid_var_by_ctx = attrs.get("resid_var_by_ctx") or {}
     n_updates_by_ctx = attrs.get("n_updates_by_ctx") or {}
 
-    # Demand -> Power learned mapping
-    power_w_by_ctx = attrs.get("power_w_by_ctx") or {}
-    power_n_by_ctx = attrs.get("power_n_by_ctx") or {}
-
-    # NEW: empirical sustaining-demand mapping
-    sustain_by_ctx = attrs.get("sustain_by_ctx") or {}
-
     migrated = False
 
     if not isinstance(theta_by_ctx, dict):
         theta_by_ctx = {}
 
-    # Determine mapping from stored feature names to new names
     map_idx = {}
     if isinstance(stored_names, list) and stored_names and isinstance(feature_names_new, list):
         for i, nm in enumerate(stored_names):
@@ -1343,61 +934,6 @@ def _load_params_from_store(unit, feature_names_new):
     out_theta = {}
     out_Pdiag = {}
     out_meta = {}
-    out_power_w = {}
-    out_power_n = {}
-    out_sustain = {}
-
-    # Parse stored power maps (if any)
-    if isinstance(power_w_by_ctx, dict):
-        for c, dm in power_w_by_ctx.items():
-            if not isinstance(dm, dict):
-                continue
-            c_k = str(c)
-            out_power_w[c_k] = {}
-            for dk, pv in dm.items():
-                try:
-                    p = float(pv)
-                except Exception:
-                    continue
-                if isfinite(p):
-                    out_power_w[c_k][str(dk)] = _clip(p, POWER_VALID_W_MIN, POWER_VALID_W_MAX)
-
-            if not out_power_w[c_k]:
-                out_power_w.pop(c_k, None)
-
-    if isinstance(power_n_by_ctx, dict):
-        for c, dm in power_n_by_ctx.items():
-            if not isinstance(dm, dict):
-                continue
-            c_k = str(c)
-            out_power_n[c_k] = {}
-            for dk, nv in dm.items():
-                try:
-                    nvv = int(nv)
-                except Exception:
-                    continue
-                if nvv < 0:
-                    nvv = 0
-                out_power_n[c_k][str(dk)] = nvv
-
-            if not out_power_n[c_k]:
-                out_power_n.pop(c_k, None)
-
-    # Parse stored sustain map (if any)
-    if isinstance(sustain_by_ctx, dict):
-        for c, obj in sustain_by_ctx.items():
-            if not isinstance(obj, dict):
-                continue
-            try:
-                eff = float(obj.get("eff"))
-                n_s = int(obj.get("n", 0))
-            except Exception:
-                continue
-            if not isfinite(eff):
-                continue
-            if n_s < 0:
-                n_s = 0
-            out_sustain[str(c)] = {"eff": float(eff), "n": int(n_s)}
 
     for ctx, th in theta_by_ctx.items():
         ctx_k = str(ctx)
@@ -1406,7 +942,6 @@ def _load_params_from_store(unit, feature_names_new):
 
         th_list = list(th)
 
-        # If old 4-feature model, expand into new base features:
         if (ver != MODEL_VERSION) and (len(th_list) == 4) and (len(feature_names_new) >= 6):
             try:
                 a0, a1, a2, a3 = [float(th_list[i]) for i in range(4)]
@@ -1419,14 +954,11 @@ def _load_params_from_store(unit, feature_names_new):
                 new_th[3] = a3 * DELTA_SCALE
                 new_th[4] = 0.0
                 new_th[5] = 0.0
-                if len(feature_names_new) >= 7:
-                    new_th[6] = 0.0
                 out_theta[ctx_k] = _project_theta(new_th, feature_names_new)
                 migrated = True
             except Exception:
                 continue
         else:
-            # Same-version path OR stored feature names exist => map by name when possible.
             if isinstance(stored_names, list) and stored_names and map_idx:
                 new_th = [0.0] * len(feature_names_new)
                 for j, nm in enumerate(feature_names_new):
@@ -1449,7 +981,6 @@ def _load_params_from_store(unit, feature_names_new):
                     continue
                 out_theta[ctx_k] = _project_theta(new_th, feature_names_new)
 
-        # Pdiag
         pd = None
         if isinstance(Pdiag_by_ctx, dict):
             pd = Pdiag_by_ctx.get(ctx_k)
@@ -1461,7 +992,6 @@ def _load_params_from_store(unit, feature_names_new):
             except Exception:
                 pass
 
-        # meta
         rv = None
         nu = None
         if isinstance(resid_var_by_ctx, dict):
@@ -1470,11 +1000,11 @@ def _load_params_from_store(unit, feature_names_new):
             nu = n_updates_by_ctx.get(ctx_k)
 
         try:
-            rvf = float(rv) if rv is not None else 0.5 * 0.5
+            rvf = float(rv) if rv is not None else 0.25
         except Exception:
-            rvf = 0.5 * 0.5
+            rvf = 0.25
         if not isfinite(rvf) or rvf <= 1e-9:
-            rvf = 0.5 * 0.5
+            rvf = 0.25
 
         try:
             nuf = int(nu) if nu is not None else 0
@@ -1487,20 +1017,14 @@ def _load_params_from_store(unit, feature_names_new):
 
     if out_theta:
         _theta_by_unit_ctx[unit_name] = out_theta
-        log.info("Daikin ML (%s): loaded %d contexts from %s (ver=%s, migrated=%s)", unit_name, len(out_theta), store, str(ver), str(migrated))
+        log.info("Daikin ML (%s): loaded %d contexts from %s (ver=%s, migrated=%s)",
+                 unit_name, len(out_theta), store, str(ver), str(migrated))
     else:
         log.info("Daikin ML (%s): no usable stored model in %s, starting fresh", unit_name, store)
 
-    _power_w_by_unit_ctx[unit_name] = out_power_w
-    _power_n_by_unit_ctx[unit_name] = out_power_n
-
-    # NEW: load sustain map
-    _sustain_eff_by_unit_ctx[unit_name] = out_sustain
-
-    # Rebuild P matrices from stored Pdiag (or default)
     n = len(feature_names_new)
     P_by_ctx = {}
-    for ctx_k, th in (_theta_by_unit_ctx.get(unit_name) or {}).items():
+    for ctx_k in (_theta_by_unit_ctx.get(unit_name) or {}).keys():
         pd = out_Pdiag.get(ctx_k)
         if isinstance(pd, list) and len(pd) == n and _all_finite(pd):
             P = [[0.0] * n for _ in range(n)]
@@ -1523,9 +1047,6 @@ def _save_params_to_store(unit):
     Pdiag_clean = {}
     resid_clean = {}
     nupd_clean = {}
-    power_w_clean = {}
-    power_n_clean = {}
-    sustain_clean = {}
 
     for ctx_k, th in (_theta_by_unit_ctx.get(unit_name) or {}).items():
         if not isinstance(th, (list, tuple)) or len(th) != n:
@@ -1564,60 +1085,6 @@ def _save_params_to_store(unit):
             nu = 0
         nupd_clean[str(ctx_k)] = nu
 
-    # Power mapping clean (Demand -> Power W)
-    pw = _power_w_by_unit_ctx.get(unit_name) or {}
-    pn = _power_n_by_unit_ctx.get(unit_name) or {}
-
-    if isinstance(pw, dict):
-        for c, dm in pw.items():
-            if not isinstance(dm, dict):
-                continue
-            c_k = str(c)
-            power_w_clean[c_k] = {}
-            for dk, pv in dm.items():
-                try:
-                    p = float(pv)
-                except Exception:
-                    continue
-                if isfinite(p):
-                    power_w_clean[c_k][str(dk)] = round(_clip(p, POWER_VALID_W_MIN, POWER_VALID_W_MAX), 3)
-            if not power_w_clean[c_k]:
-                power_w_clean.pop(c_k, None)
-
-    if isinstance(pn, dict):
-        for c, dm in pn.items():
-            if not isinstance(dm, dict):
-                continue
-            c_k = str(c)
-            power_n_clean[c_k] = {}
-            for dk, nv in dm.items():
-                try:
-                    nvv = int(nv)
-                except Exception:
-                    continue
-                if nvv < 0:
-                    nvv = 0
-                power_n_clean[c_k][str(dk)] = nvv
-            if not power_n_clean[c_k]:
-                power_n_clean.pop(c_k, None)
-
-    # NEW: sustain mapping clean (ctx -> {"eff": ewma, "n": samples})
-    sustain_map = _sustain_eff_by_unit_ctx.get(unit_name) or {}
-    if isinstance(sustain_map, dict):
-        for c, obj in sustain_map.items():
-            if not isinstance(obj, dict):
-                continue
-            try:
-                eff = float(obj.get("eff"))
-                n_s = int(obj.get("n", 0))
-            except Exception:
-                continue
-            if not isfinite(eff):
-                continue
-            if n_s < 0:
-                n_s = 0
-            sustain_clean[str(c)] = {"eff": round(float(eff), 3), "n": int(n_s)}
-
     try:
         state.set(
             store,
@@ -1628,9 +1095,6 @@ def _save_params_to_store(unit):
             Pdiag_by_ctx=Pdiag_clean,
             resid_var_by_ctx=resid_clean,
             n_updates_by_ctx=nupd_clean,
-            power_w_by_ctx=power_w_clean,
-            power_n_by_ctx=power_n_clean,
-            sustain_by_ctx=sustain_clean,  # NEW
         )
     except Exception as e:
         log.error("Daikin ML (%s): error saving model to %s: %s", unit_name, store, e)
@@ -1649,7 +1113,6 @@ def _init_context_params_if_needed(unit):
     _meta_by_unit_ctx[unit_name] = {}
 
     _load_params_from_store(unit, feature_names)
-
     _params_loaded[unit_name] = True
 
 # ------------------------------------------------------------
@@ -1753,7 +1216,6 @@ def _update_tin_history_only(u):
 
 _persist_all_stores()
 
-# Build trigger expression: "sensor.a or sensor.b"
 _INDOOR_TRIGGERS = []
 for u in DAIKINS:
     ent = u.get("INDOOR")
@@ -1775,29 +1237,17 @@ def _get_trigger_entity_from_kwargs(kwargs):
 def _ml_startup_ok():
     for u in DAIKINS:
         _init_context_params_if_needed(u)
-        _init_unit_if_needed(u["name"])
         try:
             state.set(
                 u["LEARNED_SENSOR"],
                 value=0.0,
                 unit=u["name"],
                 ctx="init",
-                note="ML v4: power map + heating curve + empirical sustain; control published on cron; init=0.0"
+                note="ML v2: discrete MPC target published on cron; init=0.0"
             )
-            try:
-                state.set(
-                    _heating_curve_entity_id(u),
-                    value=0.0,
-                    unit=u["name"],
-                    updated=round(float(time.time()), 1),
-                    note="ML: heating curve points (outside °C -> demand) (prefers empirical sustain)",
-                    curve_points=[],
-                )
-            except Exception as e:
-                log.error("Daikin ML (%s): failed to init heating curve sensor: %s", u["name"], e)
         except Exception as e:
             log.error("Daikin ML (%s): failed to init learned demand sensor: %s", u["name"], e)
-    log.info("Daikin ML MULTI v4: startup loaded for %d unit(s)", len(DAIKINS))
+    log.info("Daikin ML MULTI v2 (fixpack A): startup loaded for %d unit(s)", len(DAIKINS))
 
 # Cron + state triggers:
 if _INDOOR_TRIGGER_EXPR:
@@ -1809,83 +1259,32 @@ if _INDOOR_TRIGGER_EXPR:
         trig_ent = _get_trigger_entity_from_kwargs(kwargs)
         is_cron = (trig_ent is None)
 
-        # If triggered by an indoor sensor update: refresh target demand + attributes, but do NOT command hardware.
-        if not is_cron and trig_ent:
+        # FIXPACK A:
+        # If triggered by INDOOR sensor update, run FULL control for that unit
+        # so learned demand + ALL attributes refresh immediately.
+        if (not is_cron) and trig_ent:
             for uu in DAIKINS:
                 if uu.get("INDOOR") == trig_ent:
                     try:
-                        _run_one_unit(uu, apply_control=False, do_learning=False, trigger="indoor")
+                        _run_one_unit(uu)
                     except Exception as e:
-                        log.debug("Daikin ML (%s): indoor refresh failed: %s", uu.get("name", "?"), e)
+                        log.error("Daikin ML (%s): controller error on indoor trigger: %s", uu.get("name", "?"), e)
                     break
             return
 
-        # FIX: Cron run: full control on time cadence AND when outdoor bucket changes.
-        now_ts = time.time()
-
+        # Cron run: full control for all units
         for u in DAIKINS:
             try:
-                unit_nm = u.get("name", "?")
-                _init_unit_if_needed(unit_nm)
-
-                last_ts = float(_last_full_control_ts.get(unit_nm) or 0.0)
-                due = (now_ts - last_ts) >= CONTROL_DT_S
-
-                # outdoor bucket change trigger
-                Tout_raw = None
-                try:
-                    Tout_raw = float(state.get(u.get("OUTDOOR")))
-                except Exception:
-                    Tout_raw = None
-                cur_bucket = None
-                if Tout_raw is not None and isfinite(Tout_raw):
-                    cur_bucket = int(round(float(Tout_raw)))
-                prev_bucket = _last_outdoor_bucket.get(unit_nm)
-
-                bucket_changed = (cur_bucket is not None) and (prev_bucket is None or int(cur_bucket) != int(prev_bucket))
-
-                if due or bucket_changed:
-                    _last_full_control_ts[unit_nm] = float(now_ts)
-                    if cur_bucket is not None:
-                        _last_outdoor_bucket[unit_nm] = int(cur_bucket)
-                    _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron_full")
-                else:
-                    _run_one_unit(u, apply_control=False, do_learning=False, trigger="cron_refresh")
+                _run_one_unit(u)
             except Exception as e:
                 log.error("Daikin ML (%s): controller error: %s", u.get("name", "?"), e)
 else:
     @time_trigger("cron(*/1 * * * *)")
     def daikin_ml_controller(**kwargs):
         _update_nordpool_avg_window_hours_all()
-
-        now_ts = time.time()
-
         for u in DAIKINS:
             try:
-                unit_nm = u.get("name", "?")
-                _init_unit_if_needed(unit_nm)
-
-                last_ts = float(_last_full_control_ts.get(unit_nm) or 0.0)
-                due = (now_ts - last_ts) >= CONTROL_DT_S
-
-                Tout_raw = None
-                try:
-                    Tout_raw = float(state.get(u.get("OUTDOOR")))
-                except Exception:
-                    Tout_raw = None
-                cur_bucket = None
-                if Tout_raw is not None and isfinite(Tout_raw):
-                    cur_bucket = int(round(float(Tout_raw)))
-                prev_bucket = _last_outdoor_bucket.get(unit_nm)
-                bucket_changed = (cur_bucket is not None) and (prev_bucket is None or int(cur_bucket) != int(prev_bucket))
-
-                if due or bucket_changed:
-                    _last_full_control_ts[unit_nm] = float(now_ts)
-                    if cur_bucket is not None:
-                        _last_outdoor_bucket[unit_nm] = int(cur_bucket)
-                    _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron_full")
-                else:
-                    _run_one_unit(u, apply_control=False, do_learning=False, trigger="cron_refresh")
+                _run_one_unit(u)
             except Exception as e:
                 log.error("Daikin ML (%s): controller error: %s", u.get("name", "?"), e)
 
@@ -1894,11 +1293,6 @@ else:
 # ============================================================
 
 def _enumerate_actions(u, select_entity, min_floor, band_upper_layer, unit_has_quiet, in_cooldown, err, deadband):
-    """
-    Enumerate feasible discrete actions based on the select options and quiet-layer capability.
-    Returns list of dict:
-      {"base": base_pct, "quiet": bool|None, "eff": effective_pct}
-    """
     nums, _has_pct = _select_options_nums(select_entity)
     if not nums:
         nums = list(range(int(MIN_DEM), 101, 5))
@@ -1937,11 +1331,6 @@ def _enumerate_actions(u, select_entity, min_floor, band_upper_layer, unit_has_q
 
 def _mpc_select_best_action(u, ctx, theta, feature_names, Tin, sp, Tout_sim, prev_eff, rate_prev, deadband,
                             step_up_limit, step_down_limit, actions):
-    """
-    Discrete MPC: evaluate candidate actions using the learned rate model, pick minimum cost.
-    Respects step limits by filtering actions.
-    Returns (best_action_dict, best_cost, debug_dict)
-    """
     filtered = []
     for a in actions:
         eff = float(a["eff"])
@@ -1978,10 +1367,8 @@ def _mpc_select_best_action(u, ctx, theta, feature_names, Tin, sp, Tout_sim, pre
             Tin_sim += rate_hat * CONTROL_DT_H
             rate_sim = rate_hat
 
-        ctx_energy = _ctx_key_for_outdoor(float(Tout_sim), u.get("CTX_BIN_C", 0.0))
-        pwr_w = _power_estimate_w(u.get("name", "unit"), ctx_energy, eff)
-        energy_kwh = (float(pwr_w) / 1000.0) * (CONTROL_DT_H * float(MPC_STEPS))
-        cost_energy = energy_kwh
+        demand_norm = _clip(eff / 100.0, 0.0, 1.2)
+        cost_energy = demand_norm * demand_norm * float(MPC_STEPS)
         d = eff - prev_eff
         cost_change = d * d
 
@@ -1994,15 +1381,13 @@ def _mpc_select_best_action(u, ctx, theta, feature_names, Tin, sp, Tout_sim, pre
                 "cost_err": cost_err,
                 "cost_overshoot": cost_ov,
                 "cost_energy": cost_energy,
-                "energy_kwh": energy_kwh,
-                "pwr_w": pwr_w,
                 "cost_change": cost_change,
                 "steps": MPC_STEPS,
             }
 
     return best, float(best_cost if best_cost is not None else 1e9), best_dbg or {}
 
-def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
+def _run_one_unit(u):
     unit_name = u["name"]
     _init_context_params_if_needed(u)
     _init_unit_if_needed(unit_name)
@@ -2021,7 +1406,6 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
 
     now = time.time()
 
-    # Read sensors
     try:
         Tin = float(state.get(INDOOR))
     except Exception:
@@ -2036,22 +1420,18 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
         log.info("Daikin ML (%s): sensors not ready; Tin=%s Tout=%s", unit_name, state.get(INDOOR), state.get(OUTDOOR))
         return
 
-    # Compute effective setpoint (manual or auto base+bias)
     sp_info = _compute_effective_setpoint(u)
     sp = float(sp_info["sp"])
 
-    # Control tuning helpers
     step_limit_current = _read_float_entity(STEP_LIMIT_HELPER, 10.0)
     deadband_current = _read_float_entity(DEADBAND_HELPER, 0.1)
 
-    # Read previous select state
     prev_str = state.get(SELECT) or ""
     try:
         prev_base = float(str(prev_str).replace('%', ''))
     except Exception:
         prev_base = 60.0
 
-    # Quiet outdoor switch state (if present)
     QUIET_SW = u.get("QUIET_OUTDOOR_SWITCH")
     quiet_state = None
     quiet_on = None
@@ -2063,21 +1443,9 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
 
     unit_max_dem = MAX_DEM_LAYER if unit_has_quiet else MAX_DEM
 
-    # Compute previous "effective demand layer"
     prev_eff = float(prev_base)
     if isfinite(prev_base) and prev_base >= 100.0 - 1e-6 and unit_has_quiet and (quiet_on is False):
-        prev_eff = unit_max_dem  # 105 layer
-
-    # Read electrical power (W). Used to learn Demand -> Power (non-linear).
-    power_w, power_source, power_entity = _read_power_w_for_unit(u)
-    if power_w is not None and isfinite(float(power_w)):
-        power_w = float(_clip(power_w, POWER_VALID_W_MIN, POWER_VALID_W_MAX))
-        _last_power_w[unit_name] = power_w
-        _last_power_eff[unit_name] = float(prev_eff) if isfinite(prev_eff) else None
-    else:
-        power_w = None
-        power_source = "none"
-        power_entity = None
+        prev_eff = unit_max_dem
 
     # ------------------------------------------------------------
     # Defrost + post-defrost hold behavior
@@ -2118,19 +1486,18 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
     hold_active = (now < float(_hold_until.get(unit_name) or 0.0))
     in_cooldown = (now < float(_cooldown_until.get(unit_name) or 0.0))
 
-    # During defrost or post-defrost hold: enforce held demand and skip learning/control
     if defrosting or hold_active:
         held_opt = _held_select_option.get(unit_name) or prev_str
         held_quiet = _held_quiet_on.get(unit_name) if unit_has_quiet else None
 
-        if apply_control and held_opt and held_opt != prev_str:
+        if held_opt and held_opt != prev_str:
             try:
                 select.select_option(entity_id=SELECT, option=held_opt)
                 prev_str = held_opt
             except Exception as e:
                 log.error("Daikin ML (%s): failed to enforce held select %s: %s", unit_name, held_opt, e)
 
-        if apply_control and unit_has_quiet and held_quiet is not None and QUIET_SW:
+        if unit_has_quiet and held_quiet is not None and QUIET_SW:
             try:
                 if held_quiet and (quiet_on is False):
                     switch.turn_on(entity_id=QUIET_SW)
@@ -2147,29 +1514,29 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
             held_num = float(prev_base) if isfinite(prev_base) else 0.0
         held_num = _clip(held_num, 0.0, 100.0)
 
+        # FIXPACK A: always publish mpc_cost/mpc_dbg as safe values (never unknown)
         try:
             state.set(
                 LEARNED_SENSOR,
                 value=round(float(held_num), 1),
                 unit=unit_name,
                 ctx="hold",
-                defrosting=defrosting,
-                post_defrost_hold=hold_active,
+                defrosting=bool(defrosting),
+                post_defrost_hold=bool(hold_active),
                 hold_until=round(float(_hold_until.get(unit_name) or 0.0), 1),
                 held_select=str(held_opt),
                 held_quiet=bool(held_quiet) if unit_has_quiet and held_quiet is not None else None,
                 liquid=round(float(liquid), 1),
-                power_w=round(float(power_w), 1) if power_w is not None else None,
-                power_source=str(power_source),
-                power_entity=str(power_entity),
                 setpoint=round(sp, 2),
                 sp_mode=sp_info["sp_mode"],
+
+                mpc_cost=0.0,
+                mpc_dbg={},
             )
         except Exception as e:
             log.error("Daikin ML (%s): failed to publish held learned demand: %s", unit_name, e)
         return
 
-    # Normal operation: update Tin history
     _tin_hist_add(unit_name, now, Tin)
 
     # ------------------------------------------------------------
@@ -2225,6 +1592,7 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
     band_upper = min(global_upper, icing_cap) if in_icing_band else global_upper
 
     band_upper = min(band_upper, _max_demand_cap_for_outdoor(u, Tout_bucket, band_upper))
+
     min_floor = _min_demand_floor_for_outdoor(u, Tout_bucket)
 
     if min_floor > band_upper:
@@ -2245,28 +1613,25 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
         unit_max_dem_eff = min(unit_max_dem_eff, band_upper_layer)
 
     if prev_eff > band_upper_layer + 1e-6:
-        if not apply_control:
-            prev_eff = float(band_upper_layer)
-        else:
-            option_cap = _snap_to_select(SELECT, band_upper, -1)
-            if option_cap and option_cap != prev_str:
-                try:
-                    select.select_option(entity_id=SELECT, option=option_cap)
-                except Exception:
-                    pass
+        option_cap = _snap_to_select(SELECT, band_upper, -1)
+        if option_cap and option_cap != prev_str:
+            try:
+                select.select_option(entity_id=SELECT, option=option_cap)
+            except Exception:
+                pass
 
-            if unit_has_quiet and QUIET_SW and (quiet_on is False):
-                try:
-                    switch.turn_on(entity_id=QUIET_SW)
-                    quiet_on = True
-                except Exception:
-                    pass
+        if unit_has_quiet and QUIET_SW and (quiet_on is False):
+            try:
+                switch.turn_on(entity_id=QUIET_SW)
+                quiet_on = True
+            except Exception:
+                pass
 
-            log.info(
-                "Daikin ML (%s): CAP ENFORCED: prev=%s (eff=%.0f) -> %s (upper=%.0f, ctx=%s, Tout_bucket=%d)",
-                unit_name, prev_str, prev_eff, option_cap, band_upper_layer, ctx, Tout_bucket
-            )
-            return
+        log.info(
+            "Daikin ML (%s): CAP ENFORCED: prev=%s (eff=%.0f) -> %s (upper=%.0f, ctx=%s, Tout_bucket=%d)",
+            unit_name, prev_str, prev_eff, option_cap, band_upper_layer, ctx, Tout_bucket
+        )
+        return
 
     # ------------------------------------------------------------
     # Measure smoothed rate and decide learning update
@@ -2295,52 +1660,7 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
         rate_span_s = float(span_s) if isfinite(span_s) else 0.0
         rate_n = int(n_pts) if isinstance(n_pts, int) else 0
 
-    # FIX: Update _last_rate for MPC even on fallback (control-only), clipped
-    if isfinite(rate):
-        _last_rate[unit_name] = float(_clip(rate, -PRED_RATE_CLIP, PRED_RATE_CLIP))
-
     stable_since_change = (now - float(_last_demand_change_ts.get(unit_name) or 0.0)) >= LEARN_SKIP_AFTER_DEMAND_CHANGE_S
-    stable_since_power = (now - float(_last_demand_change_ts.get(unit_name) or 0.0)) >= POWER_LEARN_SKIP_AFTER_DEMAND_CHANGE_S
-
-    power_updated = False
-    if do_learning and (power_w is not None) and (not defrosting) and (not hold_active) and (not in_cooldown) and stable_since_power:
-        try:
-            pw = float(power_w)
-        except Exception:
-            pw = None
-        if pw is not None and isfinite(pw) and pw >= POWER_ACTIVE_MIN_W:
-            try:
-                _power_map_update(unit_name, ctx, prev_eff, pw)
-                power_updated = True
-                _save_params_to_store(u)
-            except Exception as e:
-                try:
-                    log.debug("Daikin ML (%s): power map update failed: %s", unit_name, e)
-                except Exception:
-                    pass
-
-    # ------------------------------------------------------------
-    # NEW: Empirical sustain-demand learning (for heating curve)
-    # Learn only when inside deadband and near steady, after demand has settled.
-    # ------------------------------------------------------------
-    err_now = float(sp - Tin)
-    stable_since_change_for_curve = (now - float(_last_demand_change_ts.get(unit_name) or 0.0)) >= SUSTAIN_MIN_SINCE_CHANGE_S
-
-    if (
-        do_learning
-        and used_smoothed
-        and (not defrosting)
-        and (not hold_active)
-        and (not in_cooldown)
-        and stable_since_change_for_curve
-        and abs(err_now) <= float(deadband)
-        and abs(float(rate)) <= float(SUSTAIN_RATE_ABS_MAX)
-    ):
-        try:
-            if _sustain_update(unit_name, ctx, prev_eff):
-                _save_params_to_store(u)
-        except Exception:
-            pass
 
     allow_learning = (
         (not defrosting)
@@ -2354,7 +1674,7 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
     x_meas = _build_feature_vector(u, Tin, sp, Tout_raw, prev_eff, float(_last_rate.get(unit_name) or 0.0))
     y_meas = float(rate)
 
-    if do_learning and allow_learning:
+    if allow_learning:
         y_hat = _predict_rate(theta, x_meas)
         resid = y_meas - y_hat
         if not isfinite(resid):
@@ -2370,12 +1690,8 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
             resid_var = (1.0 - RESID_EWMA_ALPHA) * resid_var + RESID_EWMA_ALPHA * (resid * resid)
             meta["resid_var"] = float(resid_var)
             _meta_by_unit_ctx[unit_name][ctx] = meta
-            log.debug(
-                "Daikin ML (%s): learning gated by outlier (ctx=%s resid=%.3f sigma=%.3f y=%.3f y_hat=%.3f)",
-                unit_name, ctx, resid, sigma, y_meas, y_hat
-            )
         else:
-            theta_new, P_new, did, resid2 = _rls_update(theta, P, x_meas, y_meas, lam=LAMBDA)
+            theta_new, P_new, did, _resid2 = _rls_update(theta, P, x_meas, y_meas, lam=LAMBDA)
             if did and _all_finite(theta_new):
                 theta_new = _project_theta(theta_new, feature_names)
                 theta = theta_new
@@ -2392,12 +1708,13 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
                 _meta_by_unit_ctx[unit_name][ctx] = meta
 
                 _save_params_to_store(u)
-            else:
-                log.debug("Daikin ML (%s): RLS update skipped/failed (ctx=%s did=%s)", unit_name, ctx, str(did))
     else:
         _theta_by_unit_ctx[unit_name][ctx] = theta
         _P_by_unit_ctx[unit_name][ctx] = P
         _meta_by_unit_ctx[unit_name][ctx] = meta
+
+    if used_smoothed and isfinite(rate):
+        _last_rate[unit_name] = float(_clip(rate, -PRED_RATE_CLIP, PRED_RATE_CLIP))
 
     # ------------------------------------------------------------
     # CONTROL: choose next action
@@ -2441,8 +1758,8 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
             target_eff = 100.0
         desired_eff = _clip(target_eff, min_floor, band_upper_layer)
         reason = "deadband_trim"
-        mpc_dbg = {"mode": "deadband_trim"}
-        mpc_cost = 0.0
+        mpc_dbg = {}
+        mpc_cost = 0.0  # FIXPACK A: never None
     else:
         if n_updates < MIN_UPDATES_FOR_MPC:
             target_eff = prev_eff + (PI_KP_PCT_PER_C * err)
@@ -2450,8 +1767,8 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
             target_eff = _clip(target_eff, prev_eff - step_down_limit, prev_eff + step_up_limit)
             desired_eff = float(target_eff)
             reason = "pi_fallback"
-            mpc_dbg = {"mode": "pi_fallback", "n_updates": int(n_updates)}
-            mpc_cost = 0.0
+            mpc_dbg = {"n_updates": int(n_updates)}
+            mpc_cost = 0.0  # FIXPACK A: never None
         else:
             filtered_actions = []
             if err > deadband + 1e-6:
@@ -2486,7 +1803,7 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
             desired_eff = float(best_action["eff"])
             reason = "mpc"
             mpc_dbg = dbg
-            mpc_cost = best_cost
+            mpc_cost = float(best_cost)
 
     desired_eff = float(_clip(desired_eff, min_floor, band_upper_layer))
 
@@ -2509,46 +1826,6 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
         opt_num = desired_base
     if opt_num > band_upper + 1e-6:
         desired_option = _snap_to_select(SELECT, band_upper, -1)
-
-    if not apply_control:
-        _publish_learned_sensor(
-            u=u,
-            ctx=ctx,
-            Tout_bucket=Tout_bucket,
-            Tin=Tin,
-            Tout_raw=Tout_raw,
-            Tout_future=Tout_future,
-            sp=sp,
-            sp_info=sp_info,
-            defrosting=defrosting,
-            hold_active=hold_active,
-            in_cooldown=in_cooldown,
-            liquid=liquid,
-            rate=rate,
-            rate_source=rate_source,
-            rate_span_s=rate_span_s,
-            rate_n=rate_n,
-            quiet_state=quiet_state,
-            prev_eff=prev_eff,
-            desired_eff=desired_eff,
-            desired_option=desired_option,
-            desired_quiet=desired_quiet,
-            reason=str(reason) + "_preview",
-            n_updates=n_updates,
-            resid_sigma=sqrt(max(1e-9, resid_var)),
-            mpc_cost=mpc_cost,
-            mpc_dbg=mpc_dbg,
-            min_floor=min_floor,
-            max_cap=band_upper,
-            band_upper_layer=band_upper_layer,
-            power_w=power_w,
-            power_source=power_source,
-            power_entity=power_entity,
-            pwr_est_prev_w=_power_estimate_w(unit_name, ctx, prev_eff),
-            pwr_est_desired_w=_power_estimate_w(unit_name, ctx, desired_eff),
-        )
-        _prev_err[unit_name] = err
-        return
 
     min_interval_s = float(_demand_change_min_interval_s(u))
     current_sig = (str(prev_str), bool(quiet_on) if unit_has_quiet else None)
@@ -2595,11 +1872,6 @@ def _run_one_unit(u, apply_control=True, do_learning=True, trigger="cron"):
                 min_floor=min_floor,
                 max_cap=band_upper,
                 band_upper_layer=band_upper_layer,
-                power_w=power_w,
-                power_source=power_source,
-                power_entity=power_entity,
-                pwr_est_prev_w=_power_estimate_w(unit_name, ctx, prev_eff),
-                pwr_est_desired_w=_power_estimate_w(unit_name, ctx, desired_eff),
             )
             _prev_err[unit_name] = err
             return
@@ -2716,44 +1988,19 @@ def _publish_learned_sensor(
     min_floor,
     max_cap,
     band_upper_layer,
-    power_w=None,
-    power_source=None,
-    power_entity=None,
-    pwr_est_prev_w=None,
-    pwr_est_desired_w=None,
 ):
     LEARNED_SENSOR = u["LEARNED_SENSOR"]
     unit_name = u["name"]
 
-    ctx_pwr = str(ctx)
+    # FIXPACK A: always HA-safe MPC fields
     try:
-        if pwr_est_prev_w is None:
-            pwr_est_prev_w = _power_estimate_w(unit_name, ctx_pwr, prev_eff)
-        if pwr_est_desired_w is None:
-            pwr_est_desired_w = _power_estimate_w(unit_name, ctx_pwr, desired_eff)
+        mpc_cost_f = float(mpc_cost)
     except Exception:
-        pass
-
-    n_map_ctx = _power_map_get_n(unit_name, ctx_pwr) or {}
-    n_map_glob = _power_map_get_n(unit_name, "global") or {}
-
-    try:
-        pwr_map_n_prev = int(n_map_ctx.get(_demand_key(prev_eff), 0))
-    except Exception:
-        pwr_map_n_prev = 0
-    try:
-        pwr_map_n_desired = int(n_map_ctx.get(_demand_key(desired_eff), 0))
-    except Exception:
-        pwr_map_n_desired = 0
-
-    try:
-        pwr_map_n_global_prev = int(n_map_glob.get(_demand_key(prev_eff), 0))
-    except Exception:
-        pwr_map_n_global_prev = 0
-    try:
-        pwr_map_n_global_desired = int(n_map_glob.get(_demand_key(desired_eff), 0))
-    except Exception:
-        pwr_map_n_global_desired = 0
+        mpc_cost_f = 0.0
+    if not isfinite(mpc_cost_f):
+        mpc_cost_f = 0.0
+    if not isinstance(mpc_dbg, dict):
+        mpc_dbg = {}
 
     try:
         state.set(
@@ -2784,16 +2031,6 @@ def _publish_learned_sensor(
             cooldown=bool(in_cooldown),
             liquid=round(float(liquid), 1),
 
-            power_w=round(float(power_w), 1) if power_w is not None else None,
-            power_source=str(power_source) if power_source is not None else None,
-            power_entity=str(power_entity) if power_entity is not None else None,
-            pwr_est_prev_w=round(float(pwr_est_prev_w), 1) if pwr_est_prev_w is not None else None,
-            pwr_est_desired_w=round(float(pwr_est_desired_w), 1) if pwr_est_desired_w is not None else None,
-            pwr_map_n_prev=int(pwr_map_n_prev),
-            pwr_map_n_desired=int(pwr_map_n_desired),
-            pwr_map_n_global_prev=int(pwr_map_n_global_prev),
-            pwr_map_n_global_desired=int(pwr_map_n_global_desired),
-
             rate=round(float(rate), 4),
             rate_source=str(rate_source),
             rate_span_s=round(float(rate_span_s), 1),
@@ -2808,261 +2045,17 @@ def _publish_learned_sensor(
 
             n_updates=int(n_updates),
             resid_sigma=round(float(resid_sigma), 4),
-            mpc_cost=round(float(mpc_cost), 4) if mpc_cost is not None else None,
+
+            # FIXPACK A: ALWAYS numeric
+            mpc_cost=round(float(mpc_cost_f), 4),
             mpc_dbg=mpc_dbg,
 
             min_floor=round(float(min_floor), 1),
             max_cap=round(float(max_cap), 1),
             band_upper_layer=round(float(band_upper_layer), 1),
         )
-        try:
-            _publish_heating_curve(u, float(sp))
-        except Exception:
-            pass
     except Exception as e:
         log.error("Daikin ML (%s): failed to update learned demand sensor: %s", unit_name, e)
-
-# ============================================================
-# 7B) HEATING CURVE PUBLISHER (learned sustaining demand vs outdoor temp)
-# ============================================================
-
-def _heating_curve_entity_id(u):
-    """
-    Returns heating-curve sensor entity_id.
-
-    Default:
-      sensor.<unit_name>_ml_heating_curve
-    """
-    try:
-        ent = u.get("HEATING_CURVE_SENSOR")
-        if ent and isinstance(ent, str) and "." in ent:
-            return ent
-    except Exception:
-        pass
-    nm = str(u.get("name") or "daikin").strip()
-    return "sensor." + nm + "_ml_heating_curve"
-
-def _heating_curve_candidate_demands(u, select_entity, min_floor, band_upper_layer, unit_has_quiet):
-    nums, _has_pct = _select_options_nums(select_entity)
-    if not nums:
-        nums = list(range(int(MIN_DEM), 101, 5))
-
-    base_max = min(float(band_upper_layer), 100.0)
-    base_min = max(float(min_floor), 0.0)
-
-    bases = [float(n) for n in nums if (float(n) >= base_min - 1e-6 and float(n) <= base_max + 1e-6)]
-    if not bases:
-        bases = [float(_clip(base_min, 0.0, base_max))]
-
-    effs = []
-    for b in bases:
-        if b < 100.0 - 1e-6:
-            effs.append(float(b))
-        else:
-            effs.append(100.0)
-
-    if unit_has_quiet and float(band_upper_layer) > 100.0 + 1e-6:
-        effs.append(float(min(MAX_DEM_LAYER, band_upper_layer)))
-
-    out = sorted(set([round(float(e), 3) for e in effs if isfinite(float(e))]))
-    return out
-
-def _pick_sustaining_demand_eff(theta, u, sp_ref, Tout_c, eff_candidates):
-    """
-    Pick effective demand that best "holds" the setpoint at this outdoor temperature.
-
-    We evaluate the learned rate model at:
-      Tin = sp (=> err = 0), rate_prev = 0
-    and choose the smallest demand that gives a non-negative predicted rate (>=0),
-    i.e. "don't cool the house".
-
-    If none are non-negative, pick the one closest to zero (least negative).
-    Returns (eff_demand, predicted_rate_at_choice).
-    """
-    try:
-        Tin_ref = float(sp_ref)
-    except Exception:
-        Tin_ref = 0.0
-
-    best_eff_pos = None
-    best_rate_pos = None
-
-    best_eff_any = None
-    best_abs_any = None
-    best_rate_any = None
-
-    for eff in eff_candidates:
-        x = _build_feature_vector(u, Tin_ref, Tin_ref, float(Tout_c), float(eff), 0.0)
-        r = _predict_rate(theta, x)
-        if not isfinite(r):
-            continue
-
-        a = abs(r)
-        if (best_abs_any is None) or (a < best_abs_any - 1e-12) or (abs(a - best_abs_any) <= 1e-12 and float(eff) < float(best_eff_any)):
-            best_abs_any = a
-            best_eff_any = float(eff)
-            best_rate_any = float(r)
-
-        if r >= -1e-9:
-            if (best_rate_pos is None) or (r < best_rate_pos - 1e-12) or (abs(r - best_rate_pos) <= 1e-12 and float(eff) < float(best_eff_pos)):
-                best_rate_pos = float(r)
-                best_eff_pos = float(eff)
-
-    if best_eff_pos is not None:
-        return float(best_eff_pos), float(best_rate_pos if best_rate_pos is not None else 0.0)
-
-    if best_eff_any is not None:
-        return float(best_eff_any), float(best_rate_any if best_rate_any is not None else 0.0)
-
-    return float(MIN_DEM), 0.0
-
-def _compute_band_limits_for_outdoor(u, Tout_c, icing_cap_value, unit_has_quiet):
-    """
-    Compute min_floor and cap for a hypothetical outdoor temperature Tout_c.
-    Mirrors the controller's clamps (global mild cap, icing cap, per-band caps/floors, quiet 105 layer).
-    """
-    Tout_bucket = int(round(float(Tout_c)))
-
-    if Tout_bucket <= -5:
-        global_upper = MAX_DEM
-    else:
-        global_upper = GLOBAL_MILD_MAX
-
-    in_icing_band = (Tout_bucket >= ICING_BAND_MIN and Tout_bucket <= ICING_BAND_MAX)
-
-    band_upper = min(float(global_upper), float(icing_cap_value)) if in_icing_band else float(global_upper)
-    band_upper = min(float(band_upper), _max_demand_cap_for_outdoor(u, Tout_bucket, band_upper))
-
-    min_floor = _min_demand_floor_for_outdoor(u, Tout_bucket)
-    if min_floor > band_upper:
-        band_upper = float(min_floor)
-
-    band_upper_layer = float(band_upper)
-    if unit_has_quiet and band_upper >= 100.0 - 1e-6:
-        band_upper_layer = float(MAX_DEM_LAYER)
-
-    return Tout_bucket, bool(in_icing_band), float(min_floor), float(band_upper), float(band_upper_layer)
-
-def _publish_heating_curve(u, sp_ref):
-    """
-    Publish heating curve sensor for this unit:
-      sensor.<unit>_ml_heating_curve
-        attributes.curve_points = [{x:<Tout>, y:<demand_eff>}, ...]
-
-    This enables Plotly cards to render a learned "heating curve" over outdoor temperature.
-
-    NEW behavior:
-      Prefer empirically learned sustain demand per ctx when available,
-      else fall back to model-derived sustain.
-    """
-    unit_name = u.get("name", "?")
-    _init_context_params_if_needed(u)
-    _init_unit_if_needed(unit_name)
-
-    now = time.time()
-    last = float(_last_curve_update_ts.get(unit_name) or 0.0)
-    if (now - last) < HEATING_CURVE_MIN_UPDATE_INTERVAL_S:
-        return
-
-    select_entity = u.get("SELECT")
-    if not select_entity:
-        return
-
-    unit_has_quiet = bool(u.get("QUIET_OUTDOOR_SWITCH"))
-    ctx_bin_c = u.get("CTX_BIN_C", 1.0)
-
-    feature_names = _feature_names_by_unit.get(unit_name) or _feature_names_for_unit(u)
-    _feature_names_by_unit[unit_name] = feature_names
-
-    icing_cap = _read_float_entity(u.get("ICING_CAP_HELPER"), ICING_BAND_CAP_DEFAULT)
-
-    theta_by_ctx = _theta_by_unit_ctx.get(unit_name) or {}
-    n_ctx = len(theta_by_ctx)
-
-    n = len(feature_names)
-    th0 = [0.0] * n
-    if n >= 7:
-        th0[2] = 5.0
-        th0[3] = 1.0
-        th0[4] = 0.3
-        th0[5] = 0.5
-        th0[6] = 1.0
-    elif n >= 6:
-        th0[2] = 5.0
-        th0[3] = 1.0
-        th0[4] = 0.3
-        th0[5] = 0.5
-    elif n >= 4:
-        th0[2] = 5.0
-        th0[3] = 1.0
-    default_theta = _project_theta(th0, feature_names)
-
-    pts = []
-    for Tout_c in range(int(HEATING_CURVE_OUT_MIN_C), int(HEATING_CURVE_OUT_MAX_C) + 1, int(HEATING_CURVE_STEP_C)):
-        ctx = _ctx_key_for_outdoor(float(Tout_c), ctx_bin_c)
-        theta = theta_by_ctx.get(ctx)
-        if theta is None:
-            nearest = _nearest_existing_ctx(theta_by_ctx, ctx, ctx_bin_c)
-            if nearest is not None and nearest in theta_by_ctx:
-                theta = theta_by_ctx[nearest]
-            else:
-                theta = default_theta
-
-        Tout_bucket, in_icing_band, min_floor, max_cap, band_upper_layer = _compute_band_limits_for_outdoor(
-            u=u,
-            Tout_c=float(Tout_c),
-            icing_cap_value=icing_cap,
-            unit_has_quiet=unit_has_quiet,
-        )
-
-        # Prefer empirical sustain map if available for this ctx
-        sustain_map = _sustain_eff_by_unit_ctx.get(unit_name) or {}
-        s_obj = sustain_map.get(str(ctx))
-        if isinstance(s_obj, dict):
-            try:
-                s_eff = float(s_obj.get("eff"))
-            except Exception:
-                s_eff = float("nan")
-            if isfinite(s_eff):
-                s_eff = float(_clip(s_eff, min_floor, band_upper_layer))
-                pts.append({"x": float(Tout_c), "y": round(float(s_eff), 1)})
-                continue
-
-        # Fallback: model-derived sustaining demand
-        eff_candidates = _heating_curve_candidate_demands(
-            u=u,
-            select_entity=select_entity,
-            min_floor=min_floor,
-            band_upper_layer=band_upper_layer,
-            unit_has_quiet=unit_has_quiet,
-        )
-
-        eff, _rhat = _pick_sustaining_demand_eff(
-            theta=theta,
-            u=u,
-            sp_ref=float(sp_ref),
-            Tout_c=float(Tout_c),
-            eff_candidates=eff_candidates,
-        )
-
-        eff = float(_clip(eff, min_floor, band_upper_layer))
-        pts.append({"x": float(Tout_c), "y": round(float(eff), 1)})
-
-    ent = _heating_curve_entity_id(u)
-    try:
-        state.set(
-            ent,
-            value=round(float(sp_ref), 2) if isfinite(float(sp_ref)) else 0.0,
-            unit=str(unit_name),
-            updated=round(float(now), 1),
-            sp_ref=round(float(sp_ref), 2) if isfinite(float(sp_ref)) else None,
-            ctx_bin_c=float(ctx_bin_c) if isfinite(float(ctx_bin_c)) else None,
-            n_ctx=int(n_ctx),
-            curve_points=pts,
-        )
-        _last_curve_update_ts[unit_name] = float(now)
-    except Exception as e:
-        log.error("Daikin ML (%s): failed to publish heating curve sensor %s: %s", unit_name, ent, e)
 
 # ============================================================
 # 8) SERVICES
@@ -3079,9 +2072,6 @@ def daikin_ml_reset():
     global _last_defrosting, _cooldown_until, _prev_err, _last_rate
     global _last_demand_change_ts, _last_demand_sig, _tin_hist
     global _hold_until, _held_select_option, _held_quiet_on
-    global _power_w_by_unit_ctx, _power_n_by_unit_ctx, _last_power_w, _last_power_eff
-    global _last_full_control_ts, _last_outdoor_bucket
-    global _sustain_eff_by_unit_ctx  # NEW
 
     for u in DAIKINS:
         unit_name = u["name"]
@@ -3093,18 +2083,6 @@ def daikin_ml_reset():
         _P_by_unit_ctx[unit_name] = {}
         _meta_by_unit_ctx[unit_name] = {}
         _params_loaded[unit_name] = False
-
-        # FIX: reset scheduler state
-        _last_full_control_ts[unit_name] = 0.0
-        _last_outdoor_bucket[unit_name] = None
-
-        _power_w_by_unit_ctx[unit_name] = {}
-        _power_n_by_unit_ctx[unit_name] = {}
-        _last_power_w[unit_name] = None
-        _last_power_eff[unit_name] = None
-
-        # NEW: reset sustain map
-        _sustain_eff_by_unit_ctx[unit_name] = {}
 
         _last_defrosting[unit_name] = None
         _cooldown_until[unit_name] = 0.0
@@ -3130,9 +2108,6 @@ def daikin_ml_reset():
                 Pdiag_by_ctx={},
                 resid_var_by_ctx={},
                 n_updates_by_ctx={},
-                power_w_by_ctx={},
-                power_n_by_ctx={},
-                sustain_by_ctx={},  # NEW
             )
             log.warning(
                 "Daikin ML RESET (%s): cleared %d learned contexts, store cleared in %s",
