@@ -656,6 +656,9 @@ _last_demand_sig       = {}  # unit -> signature tuple
 # per-unit Tin history for 5-minute smoothed slope
 _tin_hist = {}  # unit -> list[(ts, Tin)]
 
+# per-unit warmup gate: short start delay after (re)start/history reset before control+learning
+_warmup_until = {}  # unit -> epoch float (0 if inactive)
+
 # Hold demand through defrost and for N minutes after defrost ends
 _hold_until = {}          # unit -> epoch float (0 if inactive)
 _held_select_option = {}  # unit -> string option, e.g. "70%" (or "70")
@@ -673,6 +676,12 @@ def _persist_all_stores():
             state.persist(u["STORE_ENTITY"])
         except Exception as e:
             log.error("Daikin ML (%s): state.persist failed for %s: %s", u["name"], u["STORE_ENTITY"], e)
+
+        # Start with a fresh Tin history and use a short start delay before any control/learning.
+        unit_name = u.get("name", "daikin?")
+        _init_unit_if_needed(unit_name)
+        _tin_hist[unit_name] = []
+        _warmup_until[unit_name] = time.time() + float(CONTROL_DELAY_S)
 
 def _init_unit_if_needed(unit_name):
     if unit_name not in _theta_by_unit_ctx:
@@ -695,6 +704,8 @@ def _init_unit_if_needed(unit_name):
         _last_demand_sig[unit_name] = None
     if unit_name not in _tin_hist:
         _tin_hist[unit_name] = []
+    if unit_name not in _warmup_until:
+        _warmup_until[unit_name] = 0.0
     if unit_name not in _hold_until:
         _hold_until[unit_name] = 0.0
     if unit_name not in _held_select_option:
@@ -727,7 +738,7 @@ def _tin_hist_add(unit_name, ts, tin):
         new_hist = new_hist[-200:]
     _tin_hist[unit_name] = new_hist
 
-def _tin_smoothed_rate_5min(unit_name, now_ts):
+def _tin_smoothed_rate_5min(unit_name, now_ts, min_span_s=None):
     """
     Returns (rate_degC_per_hour, used_smoothed, span_s, n_samples)
     Uses linear regression slope over last ~5 minutes for smoothing.
@@ -744,7 +755,8 @@ def _tin_smoothed_rate_5min(unit_name, now_ts):
     t0 = pts[0][0]
     t1 = pts[-1][0]
     span = float(t1 - t0)
-    if span < TIN_SLOPE_MIN_SPAN_S:
+    effective_min_span = float(min_span_s) if (min_span_s is not None and isfinite(float(min_span_s))) else float(TIN_SLOPE_MIN_SPAN_S)
+    if span < effective_min_span:
         return 0.0, False, span, len(pts)
 
     ts = [p[0] for p in pts]
@@ -1019,6 +1031,12 @@ def _ml_startup_ok():
             )
         except Exception as e:
             log.error("Daikin ML (%s): failed to init learned demand sensor: %s", u["name"], e)
+
+        # Start with a fresh Tin history and use a short start delay before any control/learning.
+        unit_name = u.get("name", "daikin?")
+        _init_unit_if_needed(unit_name)
+        _tin_hist[unit_name] = []
+        _warmup_until[unit_name] = time.time() + float(CONTROL_DELAY_S)
 
     log.info("Daikin ML MULTI: startup loaded for %d unit(s)", len(DAIKINS))
 
@@ -1368,12 +1386,48 @@ def _run_one_unit(u):
             return
     # Normal operation resumes here (defrost false, hold ended).
     # Tin measurements are allowed again; start building history from scratch.
+    # Warmup gate: after any history reset (startup/defrost-hold), wait CONTROL_DELAY_S before control/learning.
+    if not (_tin_hist.get(unit_name) or []):
+        _warmup_until[unit_name] = now + float(CONTROL_DELAY_S)
     if isfinite(Tin):
         _tin_hist_add(unit_name, now, Tin)
 
     if not (isfinite(Tin) and isfinite(Tout_raw)):
         log.info("Daikin ML (%s): sensors not ready; Tin=%s Tout=%s", unit_name, cache.get(INDOOR), cache.get(OUTDOOR))
         return
+
+    # ------------------------------------------------------------
+    # Warmup: do NOTHING for a short start delay (CONTROL_DELAY_S) after init/history reset.
+    # This lets the rolling Tin history start filling before any demand control/learning starts.
+    # ------------------------------------------------------------
+    warm_until = float(_warmup_until.get(unit_name) or 0.0)
+    if warm_until > 0.0 and now < warm_until:
+        # Short start delay (eg. first 30s) right after init/history reset:
+        # collect Tin history but do not control demand or update learning yet.
+        try:
+            hist = _tin_hist.get(unit_name) or []
+            span_s = (hist[-1][0] - hist[0][0]) if len(hist) >= 2 else 0.0
+            n_pts = len(hist)
+        except Exception:
+            span_s = 0.0
+            n_pts = 0
+        try:
+            state.set(
+                LEARNED_SENSOR,
+                value=round(float(prev), 1) if isfinite(prev) else 0.0,
+                unit=unit_name,
+                ctx="warmup",
+                note="start_delay_collecting_history",
+                control_starts_at=round(warm_until, 1),
+                control_remaining_s=round(max(0.0, warm_until - now), 1),
+                tin_slope_span_s=round(float(span_s), 1),
+                tin_slope_n=int(n_pts),
+            )
+        except Exception:
+            pass
+        return
+    # Start delay passed -> allow normal operation
+    _warmup_until[unit_name] = 0.0
 
     Tout_bucket = int(round(Tout_raw))
     ctx = _context_key_for_outdoor(Tout_raw)
@@ -1465,66 +1519,45 @@ def _run_one_unit(u):
 
     prev_eff = prev if prev <= band_upper_layer else band_upper_layer
 
+
     # ------------------------------------------------------------
-    # Learning rate uses smoothed 5-minute Tin slope.
-    # If not enough history yet, fall back to the derivative sensor.
+    # Tin slope (rolling window from init)
+    #
+    # - We always keep collecting Tin history into a rolling ~5 min window.
+    # - After CONTROL_DELAY_S (eg. 30s) we start control + learning.
+    # - Before we have a "full" window (>= TIN_SLOPE_MIN_SPAN_S), we still compute
+    #   a regression slope (>= CONTROL_DELAY_S), but we DISABLE derivative damping
+    #   to avoid demand spikes from early/noisy slopes.
     # ------------------------------------------------------------
-    sm_rate, used_smoothed, span_s, n_pts = _tin_smoothed_rate_5min(unit_name, now)
+    sm_rate, used_smoothed, span_s, n_pts = _tin_smoothed_rate_5min(
+        unit_name, now, min_span_s=CONTROL_DELAY_S
+    )
+
+    rate_full_5min = bool(isfinite(span_s) and float(span_s) >= float(TIN_SLOPE_MIN_SPAN_S))
+
     if used_smoothed and isfinite(sm_rate):
         rate = float(sm_rate)
         rate_bad = False
-        rate_source = "smoothed_5min"
+        rate_source = "smoothed_rolling"
         rate_span_s = float(span_s)
         rate_n = int(n_pts)
     else:
-        # Fallback: derivative sensor (existing behavior)
-        try:
-            rate = float(cache.get_float(INDOOR_RATE, default=0.0))
-        except Exception:
-            rate = 0.0
-        if not isfinite(rate):
-            log.warning(
-                "Daikin ML (%s): INDOOR_RATE not finite (%s) -> forcing 0.0 and skipping learning this tick",
-                unit_name, str(cache.get(INDOOR_RATE))
-            )
-            rate = 0.0
-            rate_bad = True
-        else:
-            rate_bad = False
-        rate_source = "derivative_fallback"
+        # Not enough history yet: proceed with control (no derivative term), skip learning this tick.
+        rate = 0.0
+        rate_bad = True
+        rate_source = "insufficient_history"
         rate_span_s = float(span_s) if isfinite(span_s) else 0.0
-        rate_n = int(n_pts) if isinstance(n_pts, int) else 0
-
-
-    # If 5min smoothing is not active yet, the derivative fallback can be noisy and
-    # may cause demand spikes. During this warm-up period, do nothing and keep the
-    # previously effective demand until we have enough history for smoothed_5min.
-    if not used_smoothed:
         try:
-            state.set(
-                LEARNED_SENSOR,
-                value=round(float(prev_eff), 1),
-                unit=unit_name,
-                ctx=ctx,
-                note="waiting_for_5min_smoothing",
-                rate_source=str(rate_source),
-                rate_span_s=float(rate_span_s) if isfinite(rate_span_s) else 0.0,
-                rate_n=int(rate_n) if isinstance(rate_n, int) else 0,
-            )
+            rate_n = int(n_pts)
         except Exception:
-            pass
-        log.info(
-            "Daikin ML (%s): waiting for 5min smoothing (rate_source=%s n=%s span=%.0fs) -> holding demand prev_eff=%.1f",
-            unit_name, str(rate_source), str(rate_n),
-            float(rate_span_s) if isfinite(rate_span_s) else 0.0,
-            float(prev_eff),
-        )
-        return
+            rate_n = 0
 
     err         = sp - Tin
     demand_norm = _clip(prev_eff / 100.0, 0.0, 1.0)
     x = [1.0, err, demand_norm, (Tout_raw - Tin)]
-    y = rate
+    y = _clip(rate, -LEARN_RATE_CLAMP_CPH, LEARN_RATE_CLAMP_CPH)
+    if not rate_full_5min:
+        y = _clip(y, -LEARN_RATE_CLAMP_CPH_WARMUP, LEARN_RATE_CLAMP_CPH_WARMUP)
 
     allow_learning = (not defrosting) and (not hold_active) and (not in_cooldown) and (not rate_bad)
 
@@ -1533,6 +1566,18 @@ def _run_one_unit(u):
         P_prev = [row[:] for row in P]
 
         theta_new, P_new = _rls_update(theta, P, x, y)
+        # Enforce positive demand effect: theta[2] must remain > 0 to avoid dem_opt collapsing to 0.
+        try:
+            if isfinite(float(theta_new[2])):
+                if float(theta_new[2]) < float(THETA2_MIN_POS):
+                    theta_new[2] = float(THETA2_MIN_POS)
+                elif float(theta_new[2]) > float(THETA2_MAX_POS):
+                    theta_new[2] = float(THETA2_MAX_POS)
+            else:
+                theta_new[2] = float(max(float(THETA2_MIN_POS), float(theta[2]) if isfinite(float(theta[2])) else THETA2_MIN_POS))
+        except Exception:
+            pass
+
 
         if _all_finite(theta_new):
             theta = theta_new
@@ -1572,15 +1617,21 @@ def _run_one_unit(u):
     num = dTin_target - (theta[0] + theta[1] * err + theta[3] * (Tout_eff - Tin))
 
     denom_raw = theta[2]
-    if (not isfinite(denom_raw)) or abs(denom_raw) < 1e-6:
+    # Force physically-plausible positive demand coefficient (keep theta[2] > 0)
+    try:
+        denom_raw = float(denom_raw)
+    except Exception:
         denom_raw = 5.0
+    if (not isfinite(denom_raw)) or denom_raw < float(THETA2_MIN_POS):
+        denom_raw = float(THETA2_MIN_POS)
+    if denom_raw > float(THETA2_MAX_POS):
+        denom_raw = float(THETA2_MAX_POS)
 
-    denom_sign = 1.0 if denom_raw >= 0 else -1.0
-    denom_mag  = abs(denom_raw)
-    if denom_mag < 0.5:
-        denom_mag = 0.5
+    denom_mag = abs(denom_raw)
+    if denom_mag < float(THETA2_MIN_POS):
+        denom_mag = float(THETA2_MIN_POS)
 
-    dem_opt = _clip((num / (denom_mag * denom_sign)) * 100.0, 0.0, unit_max_dem_eff)
+    dem_opt = _clip((num / denom_mag) * 100.0, 0.0, unit_max_dem_eff)
 
     if not isfinite(dem_opt):
         log.error(
@@ -1588,6 +1639,15 @@ def _run_one_unit(u):
             unit_name, ctx, prev_eff
         )
         dem_opt = prev_eff
+
+    # Safety: if we are below setpoint and still cooling (Tin falling), never let ML base demand collapse to ~0.
+    try:
+        if isfinite(err) and err > deadband and isfinite(rate) and rate < -0.05:
+            floor_eff = max(float(min_floor), float(MIN_DEM))
+            if isfinite(dem_opt) and float(dem_opt) < floor_eff:
+                dem_opt = max(float(prev_eff) if isfinite(prev_eff) else floor_eff, floor_eff)
+    except Exception:
+        pass
 
     # Quiet outdoor extra layer (OPTIONAL): only if unit has quiet switch.
     # never allow 105 layer during cooldown
@@ -1624,6 +1684,7 @@ def _run_one_unit(u):
             rate_source=rate_source,
             rate_span_s=round(float(rate_span_s), 1),
             rate_n=int(rate_n),
+            rate_full_5min=bool(rate_full_5min),
             quiet_outdoor=quiet_state,
             demand_layer_max=(unit_max_dem_eff if (unit_has_quiet and band_upper >= 100.0) else band_upper),
             min_floor=round(float(min_floor), 1),
@@ -1652,8 +1713,8 @@ def _run_one_unit(u):
 
     i = float(_err_int.get(unit_name) or 0.0)
 
-    # Clamp rate for damping
-    rate_cph = _clip(rate, -TRACK_RATE_CLAMP_CPH, TRACK_RATE_CLAMP_CPH)
+    # Clamp rate for damping. Enable derivative damping only once we have a "full" slope window.
+    rate_cph = _clip(rate, -TRACK_RATE_CLAMP_CPH, TRACK_RATE_CLAMP_CPH) if rate_full_5min else 0.0
 
     # Integrator input: ignore tiny noise near setpoint
     err_i_in = err
