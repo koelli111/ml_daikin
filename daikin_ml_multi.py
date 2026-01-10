@@ -1495,6 +1495,32 @@ def _run_one_unit(u):
         rate_span_s = float(span_s) if isfinite(span_s) else 0.0
         rate_n = int(n_pts) if isinstance(n_pts, int) else 0
 
+
+    # If 5min smoothing is not active yet, the derivative fallback can be noisy and
+    # may cause demand spikes. During this warm-up period, do nothing and keep the
+    # previously effective demand until we have enough history for smoothed_5min.
+    if not used_smoothed:
+        try:
+            state.set(
+                LEARNED_SENSOR,
+                value=round(float(prev_eff), 1),
+                unit=unit_name,
+                ctx=ctx,
+                note="waiting_for_5min_smoothing",
+                rate_source=str(rate_source),
+                rate_span_s=float(rate_span_s) if isfinite(rate_span_s) else 0.0,
+                rate_n=int(rate_n) if isinstance(rate_n, int) else 0,
+            )
+        except Exception:
+            pass
+        log.info(
+            "Daikin ML (%s): waiting for 5min smoothing (rate_source=%s n=%s span=%.0fs) -> holding demand prev_eff=%.1f",
+            unit_name, str(rate_source), str(rate_n),
+            float(rate_span_s) if isfinite(rate_span_s) else 0.0,
+            float(prev_eff),
+        )
+        return
+
     err         = sp - Tin
     demand_norm = _clip(prev_eff / 100.0, 0.0, 1.0)
     x = [1.0, err, demand_norm, (Tout_raw - Tin)]
