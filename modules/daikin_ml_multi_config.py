@@ -185,6 +185,12 @@ TRACK_I_LEAK = 0.03  # 3% per control tick when |err| <= deadband
 # Clamp rate used for KD damping (°C/h)
 TRACK_RATE_CLAMP_CPH = 3.0
 
+LEARN_RATE_CLAMP_CPH = 4.0
+LEARN_RATE_CLAMP_CPH_WARMUP = 2.0
+
+# Enforce physically-plausible demand effect (theta[2] should be positive in heating mode)
+THETA2_MIN_POS = 0.5   # minimum allowed theta[2]
+THETA2_MAX_POS = 30.0  # maximum allowed theta[2]
 # Override demand-change min-interval when tracking is clearly off
 TRACK_MIN_INTERVAL_OVERRIDE_ERR = 0.25  # °C
 
@@ -210,6 +216,9 @@ INSTANT_DEMAND_CONTROL = True
 # - Keeps a per-unit history of (timestamp, Tin)
 # - If not enough history/span, falls back to the derivative sensor
 # ------------------------------------------------------------
+# Controller start delay after init/history reset (seconds)
+CONTROL_DELAY_S = 30.0
+
 TIN_SLOPE_WINDOW_S = 5 * 60.0
 TIN_SLOPE_MIN_SPAN_S = 4 * 60.0  # require at least ~4 minutes span for "true 5-minute" slope
 TIN_SLOPE_MIN_SAMPLES = 3        # require a few points for smoothing/robustness
@@ -267,3 +276,5 @@ AVG_WINDOW_MAX_H = 4.0
 AVG_WINDOW_TEMP_COLD = -20.0   # at / below this => AVG_WINDOW_MIN_H
 AVG_WINDOW_TEMP_WARM = 0.0     # at / above this => AVG_WINDOW_MAX_H
 AVG_WINDOW_WRITE_EPS = 0.1     # don't spam helper writes
+
+
