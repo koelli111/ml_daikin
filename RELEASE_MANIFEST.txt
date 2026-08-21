@@ -1,0 +1,156 @@
+# Daikin dual controller separate-area topology
+# Release: 2026-08-21-separate-areas-r10-r2
+# Created: 2026-08-21 Europe/Helsinki
+
+# Installable files:
+127677fb722b498f0a733acd9372615b1c2e7de13affd4638621934697206b40  daikin_ml_multi.py
+6d082ac1b7beb4946f0f6f912d575b0997997adf6ea9839cae626892bb80c2b0  daikin_ml_multi_config.py
+e190441c580d4dfc2ac4360a8fb15ecbcd5fa597b2376cb5ffae632e41934c05  daikin_dual_helpers.yaml
+c876222175edbbc34162538f2f99d5db776806114691f79da916b6f997bbf5ff  daikin_watchdog_package.yaml
+749f88066e1ea68d0b795e54ec0de005a9c8918c4bd94d32529f0b29413e21bc  daikin_diagnostics_dashboard.yaml
+a28b4adce40b469bf263851d314a65e295b999c1ae1a16cf812ae44a9f4aa349  README_DAIKIN_DUAL.md
+ad9e1acb238c3bffef2b07dd01d780e5564c8a2d57039b2b887d6afcc3549c1c  BUILD_INFO.txt
+
+# Offline validation:
+b2b442edc15e9fe0ce7a6f9cc60b95b113c8abfcd079861d192c57f584afd2f6  validation/test_safety_commissioning.py
+
+# Validation results:
+# - Python compilation: PASS
+# - Runtime scenarios: 134 passed
+# - Unsupported Pyscript GeneratorExp/Yield/YieldFrom nodes in installable Python: 0
+# - YAML parsing (helpers, watchdog, dashboard): PASS
+# - Exactly one recurring time trigger plus startup: PASS
+# - Independent state/report/command/adaptive triggers removed: PASS
+# - Legacy _run_one_unit and RLS theta/P controller removed: PASS
+# - Generation-based command supersession: PASS
+# - Daikin2 is the only configured temperature-cooling unit: PASS
+# - Daikin2 is the only configured humidity-drying unit: PASS
+# - Daikin1 is the only configured dry-mode reheat unit: PASS
+# - UI heating-lead switch defaults to Daikin2 and can select Daikin1: PASS
+# - Heating-lead switch does not change cooling/drying/reheat roles: PASS
+# - Cooling allocator exposes only the Daikin2-only action: PASS
+# - Full cooling PI allocation commands Daikin2 only: PASS
+# - Active Daikin2 cool/dry Demand is fixed at 100 regardless of PI request,
+#   bounds, step limit, post-defrost hold or Demand cadence: PASS
+# - Summer heating normally remains at Demand 30: PASS
+# - auto + fan active heating retains mediumHigh after the shared fan override: PASS
+# - Explicit off + FAN calibration profiles every advertised fixed fan setting: PASS
+# - Per-setting RPM uses a robust median and persists per unit: PASS
+# - Missing RPM calibration disables CDP escalation without guessing: PASS
+# - CDP restriction/release uses 75/85 percent of calibrated requested RPM: PASS
+# - Confirmed mediumHigh fan suppression raises only the affected heating unit
+#   in five-point steps on the serialized 20-second adaptive path: PASS
+# - CDP release Demand is capped at 60 and lower successful Demand is probed: PASS
+# - Retained MQTT fan RPM remains valid regardless of timestamp age: PASS
+# - Both `heat` and `heating` HVAC actions confirm physical heating: PASS
+# - Configured compressor/running evidence confirms CDP heating when the
+#   integration reports an idle or nonstandard HVAC action: PASS
+# - CDP stabilization, suppression confirmation and upward Demand cadence use
+#   the serialized 20-second adaptive interval: PASS
+# - Released airflow is confirmed in 20 seconds and probes five points lower
+#   after a three-minute sustaining observation: PASS
+# - A failed downward probe immediately restores the last release Demand: PASS
+# - Lowest confirmed per-unit release Demand persists and is reused: PASS
+# - Heating learning accepts physical heat plus heat/heating action or explicit
+#   configured compressor-running evidence: PASS
+# - Explicit compressor-off evidence rejects idle heating learning: PASS
+# - Cooling and drying retain strict HVAC-action confirmation: PASS
+# - CDP floor learning stores per-unit/per-fan sufficient and insufficient
+#   Demand boundaries in 2 C outdoor-temperature buckets: PASS
+# - Exact lookup, conservative interpolation, confidence safety margin and
+#   confidence ageing select the current outdoor-temperature floor: PASS
+# - Outdoor movement beyond the stability limit blocks curve learning: PASS
+# - Demand 30 is learned once per stable heating episode after three minutes
+#   of continuously released airflow: PASS
+# - Dedicated curve sensor exposes current floor, ordered graph points and
+#   detailed per-unit confidence/boundary records: PASS
+# - Shared topology continues to use only the configured Apollo zone sensor: PASS
+# - Separate topology uses sensor.faikin_ac_home for Daikin1 and the Apollo
+#   default sensor for Daikin2 with independent setpoints and modes: PASS
+# - Duplicate separate-area indoor sensors block topology activation: PASS
+# - Per-unit defrost does not freeze or block the other area: PASS
+# - Per-area Summer switches are isolated from the shared Summer switch: PASS
+# - Shared lead/assist allocation, assistance and standby circulation are
+#   reported disabled in separate topology: PASS
+# - Separate COP/Demand learning records remain per-unit and are persisted: PASS
+# - Separate zones retain independent minimum timers, temperature rates and
+#   predictive landing state: PASS
+# - Separate Daikin1 remains heat/fan only while Daikin2 can cool/dry: PASS
+# - Invalid fan sensing, mode/action mismatch, defrost and post-defrost recovery
+#   fail safely to Demand 30: PASS
+# - Learned released-airflow levels persist per unit across restart: PASS
+# - Summer Mode off restores ordinary heating Demand control: PASS
+# - Daikin2 temperature cooling maps to physical cool at 16 C: PASS
+# - Cooling lowMedium fan is acknowledged before physical cool starts: PASS
+# - Native dry at 18 C transitions to logical cooling as cool, then 16 C: PASS
+# - Native dry at 18 C remains physical dry, then receives 16 C: PASS
+# - Physical cool must remain stable for 20 seconds before the 16 C write: PASS
+# - First 16 C report remains provisional for a 20-second stable window: PASS
+# - Delayed 18 C rollback revokes provisional acknowledgement immediately: PASS
+# - Delayed 18 C rollback resends 16 C in the same desired generation: PASS
+# - off + FAN commands both units to fan_only with fan lowMedium: PASS
+# - Reported physical fan_only acknowledges off + FAN without error: PASS
+# - Active heating uses mediumHigh in normal auto, auto + fan and reheat: PASS
+# - auto + fan idles with both units in fan_only at lowMedium: PASS
+# - auto + fan idle ventilation continues during compressor minimum-off wait: PASS
+# - Accepted conditioning demand interrupts auto + fan idle ventilation: PASS
+# - auto + fan never commands physical auto or heat_cool: PASS
+# - Shared fan modes clear stale temperature, Demand and Quiet intents: PASS
+# - Shared fan modes are distinct from the timed post-cycle coil-dry state: PASS
+# - Persisted Daikin2 summer target 18 C is canonicalized to 16 C before reconciliation: PASS
+# - Direct/stale summer target 18 C is rejected and commanded back to 16 C: PASS
+# - Demand expected 95 / actual 100 remains recoverable and later acknowledges: PASS
+# - Valid Demand/mode/target/fan/Quiet mismatches never become terminal by timeout: PASS
+# - Recovery cycles back off from 30 seconds to a five-minute cap: PASS
+# - Unavailable entities wait without consuming attempts or sending commands: PASS
+# - Fixed 16 C target mismatch remains in the same authoritative generation: PASS
+# - Target acknowledgement window is extended before fail-tolerant recovery: PASS
+# - Advertised unsupported values become terminal without repeated service spam: PASS
+# - Climate min_temp above the required 16 C target is reported as a validation failure: PASS
+# - Daikin1 rejects all logical cool/dry requests: PASS
+# - Reconciler blocks direct Daikin1 cooling desired-state writes: PASS
+# - Persisted Daikin1 cool/dry intents are discarded during load: PASS
+# - Supervisor starts and reasserts summer conditioning on Daikin2: PASS
+# - Dry fallback allocation contains only the configured drying unit: PASS
+# - Daikin1-only configuration blocks cool with cooling_unit_unavailable: PASS
+# - Daikin1-only configuration blocks dry with drying_unit_unavailable: PASS
+# - Daikin2 humidity drying maps to native physical dry: PASS
+# - Daikin2 humidity-dry device target is 16 C: PASS
+# - Daikin2 advertised fan modes reproduced exactly: PASS
+# - Drying level 2/5 resolves to exact lowMedium option: PASS
+# - Daikin2 lowMedium fan is acknowledged before physical dry starts: PASS
+# - Generic 2 and 2/5 aliases resolve only through advertised options: PASS
+# - Unadvertised/missing fan options are never sent to climate.set_fan_mode: PASS
+# - Unresolved active fan mode blocks compressor start without service retries: PASS
+# - Every active heating path uses the exact advertised mediumHigh option: PASS
+# - Daikin1 dry-mode reheat uses physical heat, 31 C and mediumHigh fan: PASS
+# - Reheat starts from measured/projected approach to effective setpoint: PASS
+# - Leaving dry for heat restores Auto before the new mode: PASS
+# - Leaving dry for off restores Auto without delaying shutdown: PASS
+# - Coil-dry fan_only restores automatic fan: PASS
+# - Restart reconstructs physical dry + heat as logical dry/reheat: PASS
+# - Demand/Quiet/fan acknowledgement precedes start mode and target: PASS
+# - A newer off intent invalidates an older heat retry: PASS
+# - Terminal failure is not requeued until desired generation changes: PASS
+# - Per-unit minimum-on/off runtime timers: PASS
+# - Load-before-save runtime persistence: PASS
+# - Explicit defrost restart reconstruction: PASS
+# - Daikin1 canonical explicit-defrost mapping uses sensor.daikin1_defrost: PASS
+# - Stale recognized Daikin1 explicit True/False remains authoritative: PASS
+# - Liquid debounce counts distinct reports, not evaluations: PASS
+# - COP selector receives operating_mode=heat in optimizer auto mode: PASS
+# - Allocation policies remain balanced/Daikin1-only/Daikin2-only: PASS
+# - Daikin2-only heating keeps Daikin1 in fan_only at lowMedium: PASS
+# - Daikin1 circulation power is included in Daikin2-only COP/energy scoring: PASS
+# - Stale finite indoor value remains usable for comfort control: PASS
+# - Stale recognized explicit defrost True/False remains authoritative: PASS
+# - Confirmed outdoor allowlist accepts sensor.iv_tulo_lampotila: PASS
+# - Daikin2 power/COP/explicit-defrost mappings: PASS
+# - Power-weighted combined COP and live pre-learning visibility: PASS
+# - Predictive reduction-only landing and all Demand step limits: PASS
+# - Anomaly shutdown invariant shutdown_required=false: PASS
+# - Watchdog remains alert-only and has no climate.turn_off action: PASS
+
+# Watchdog climates (monitoring only; never commanded by watchdog):
+# - climate.faikin_mqtt_hvac
+# - climate.94a9903980ec_mqtt_hvac

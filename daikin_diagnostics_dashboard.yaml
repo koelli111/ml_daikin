@@ -1,0 +1,93 @@
+# Paste this as a manual Lovelace card after installing the controller.
+type: vertical-stack
+cards:
+  - type: entities
+    title: Daikin safety and control
+    show_header_toggle: false
+    entities:
+      - input_select.daikin_dual_hvac_mode
+      - input_boolean.daikin_separate_areas
+      - input_select.daikin1_area_hvac_mode
+      - input_number.daikin1_area_setpoint
+      - input_boolean.daikin1_area_summer_mode
+      - input_select.daikin2_area_hvac_mode
+      - input_number.daikin2_area_setpoint
+      - input_boolean.daikin2_area_summer_mode
+      - input_boolean.daikin_summer_mode
+      - input_boolean.daikin1_heating_lead
+      - input_boolean.daikin_controller_shadow_mode
+      - input_boolean.daikin_watchdog_enabled
+      - binary_sensor.daikin_controller_heartbeat_stale
+      - binary_sensor.daikin_controller_safety_trip
+      - sensor.daikin_dual_health
+      - sensor.daikin_dual_controller_heartbeat
+      - sensor.daikin_dual_mode_status
+      - sensor.daikin_dual_command_status
+      - sensor.daikin_dual_total_demand
+      - sensor.daikin_dual_landing_status
+      - sensor.daikin_dual_learning_status
+      - sensor.daikin_dual_efficiency_optimizer
+      - sensor.daikin_dual_cop_efficiency
+      - sensor.daikin_dual_daily_stats
+      - sensor.daikin_dual_commissioning
+      - sensor.daikin_dual_history_replay
+      - sensor.daikin_separate_areas_status
+      - sensor.daikin_dual_cdp_temperature_curve
+      - pyscript.daikin_system_defrost_freeze
+
+  - type: conditional
+    conditions:
+      - entity: input_boolean.daikin_watchdog_tripped
+        state: "on"
+    card:
+      type: markdown
+      title: Daikin controller anomaly
+      content: >-
+        The independent watchdog is alert-only. It did not change either HVAC
+        unit. Inspect the health, command and heartbeat entities.
+
+  - type: markdown
+    title: Health interpretation
+    content: >-
+      `control_hold_active: true` or `commands_frozen: true` means the
+      controller is preserving the current HVAC modes and Demand values during
+      an indoor/climate anomaly or its short recovery. `shutdown_required`
+      always remains false for anomalies. Feature-only degradation leaves
+      ordinary comfort control running. Inspect
+      `original_trigger`, `recovery_remaining_seconds`,
+      `feature_degradations`, `diagnostic_warnings`,
+      `outdoor_fallback_active`, and
+      `optimizer_suspended` in sensor.daikin_dual_health. The
+      `sensor_report_sequence`, `last_sensor_report_entities`, and
+      `last_sensor_report_at` attributes confirm that unchanged-value sensor
+      reports are being received by the controller. A finite indoor value with
+      `stale: true`, `usable_for_control: true`, and
+      `stale_is_warning_only: true` remains active for comfort control; only
+      learning and optimization wait for a fresh report.
+
+  - type: markdown
+    title: Coordinated drying
+    content: >-
+      During humidity-driven dry with two configured units,
+      sensor.daikin_dual_mode_status reports `coordinated_reheat_drying`,
+      `dry_lead_mode`, `dry_assist_mode`, `dry_reheat_active`,
+      `dry_lead_paused`, and the complete `dry_coordination` object.
+      sensor.daikin_dual_total_demand exposes separate `dry_demand` and
+      `reheat_demand` values.
+
+  - type: history-graph
+    title: Daikin comfort and output
+    hours_to_show: 24
+    entities:
+      - entity: sensor.apollo_temp_1_95d874_temperature_probe
+        name: Shared / Daikin2 area temperature
+      - entity: sensor.faikin_ac_home
+        name: Daikin1 area temperature
+      - entity: sensor.apollo_temp_1_95d874_board_humidity
+        name: Humidity
+      - entity: sensor.daikin_dual_total_demand
+        name: Demand points
+      - entity: sensor.daikin_dual_cop_efficiency
+        name: Combined COP
+      - entity: sensor.daikin_dual_cdp_temperature_curve
+        name: Current CDP floor

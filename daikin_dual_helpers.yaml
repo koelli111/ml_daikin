@@ -1,0 +1,331 @@
+# Home Assistant package for daikin_ml_multi.py dual-unit optimization.
+#
+# Installation as a package:
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# Copy this file to /config/packages/daikin_dual_helpers.yaml and restart HA,
+# or merge these top-level sections into your existing helper configuration.
+# Deliberately no `initial:` keys: Home Assistant restores the user's last
+# value across restarts instead of resetting commissioning settings.
+
+input_select:
+  daikin_dual_hvac_mode:
+    name: Daikin shared HVAC mode
+    icon: mdi:heat-pump
+    options:
+      - "off"
+      - auto
+      - heat
+      - cool
+      - dry
+      - "off + FAN"
+      - "auto + fan"
+
+  daikin_dual_optimizer_mode:
+    name: Daikin dual optimizer mode
+    icon: mdi:chart-bell-curve-cumulative
+    options:
+      - disabled
+      - shadow
+      - auto
+
+  daikin1_area_hvac_mode:
+    name: Daikin1 area HVAC mode
+    icon: mdi:home-thermometer
+    options:
+      - "off"
+      - auto
+      - heat
+      - fan
+
+  daikin2_area_hvac_mode:
+    name: Daikin2 area HVAC mode
+    icon: mdi:home-thermometer
+    options:
+      - "off"
+      - auto
+      - heat
+      - cool
+      - dry
+      - fan
+
+input_boolean:
+  daikin_separate_areas:
+    name: Daikin separate areas
+    icon: mdi:home-switch
+
+  daikin1_area_summer_mode:
+    name: Daikin1 area summer mode
+    icon: mdi:weather-sunny
+
+  daikin2_area_summer_mode:
+    name: Daikin2 area summer mode
+    icon: mdi:weather-sunny
+
+  daikin_summer_mode:
+    name: Daikin summer mode
+    icon: mdi:weather-sunny
+
+  daikin1_heating_lead:
+    name: Use Daikin1 as first heating unit
+    icon: mdi:swap-horizontal-bold
+
+  daikin_dual_optimizer_manual_override:
+    name: Daikin dual optimizer manual override
+    icon: mdi:hand-back-right
+
+  daikin_controller_shadow_mode:
+    name: Daikin full controller shadow mode
+    icon: mdi:eye-outline
+
+  daikin_watchdog_enabled:
+    name: Daikin independent watchdog enabled
+    icon: mdi:shield-check
+
+  daikin_watchdog_tripped:
+    name: Daikin independent watchdog tripped
+    icon: mdi:shield-alert
+
+input_number:
+  daikin1_area_setpoint:
+    name: Daikin1 area setpoint
+    icon: mdi:thermometer
+    min: 15
+    max: 28
+    step: 0.1
+    unit_of_measurement: °C
+    mode: box
+
+  daikin2_area_setpoint:
+    name: Daikin2 area setpoint
+    icon: mdi:thermometer
+    min: 15
+    max: 28
+    step: 0.1
+    unit_of_measurement: °C
+    mode: box
+
+  daikin1_area_minimum_on_minutes:
+    name: Daikin1 area minimum on time
+    icon: mdi:timer-play-outline
+    min: 0
+    max: 120
+    step: 1
+    unit_of_measurement: min
+    mode: box
+
+  daikin1_area_minimum_off_minutes:
+    name: Daikin1 area minimum off time
+    icon: mdi:timer-stop-outline
+    min: 0
+    max: 120
+    step: 1
+    unit_of_measurement: min
+    mode: box
+
+  daikin2_area_minimum_on_minutes:
+    name: Daikin2 area minimum on time
+    icon: mdi:timer-play-outline
+    min: 0
+    max: 120
+    step: 1
+    unit_of_measurement: min
+    mode: box
+
+  daikin2_area_minimum_off_minutes:
+    name: Daikin2 area minimum off time
+    icon: mdi:timer-stop-outline
+    min: 0
+    max: 120
+    step: 1
+    unit_of_measurement: min
+    mode: box
+  daikin_watchdog_timeout_minutes:
+    name: Daikin watchdog heartbeat timeout
+    icon: mdi:timer-alert-outline
+    min: 3
+    max: 15
+    step: 1
+    unit_of_measurement: min
+    mode: box
+
+  daikin_heat_on_delta:
+    name: Daikin heating start below setpoint
+    icon: mdi:thermometer-minus
+    min: 0.05
+    max: 2.0
+    step: 0.05
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_heat_off_delta:
+    name: Daikin heating stop above setpoint
+    icon: mdi:thermometer-plus
+    min: 0
+    max: 2.0
+    step: 0.05
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_cool_on_delta:
+    name: Daikin cooling start above setpoint
+    icon: mdi:thermometer-plus
+    min: 0.05
+    max: 2.0
+    step: 0.05
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_cool_off_delta:
+    name: Daikin cooling stop below setpoint
+    icon: mdi:thermometer-minus
+    min: 0
+    max: 2.0
+    step: 0.05
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_auto_heat_on_delta:
+    name: Daikin auto heating start below setpoint
+    icon: mdi:thermometer-minus
+    min: 0.40
+    max: 3.0
+    step: 0.05
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_auto_cool_on_delta:
+    name: Daikin auto cooling start above setpoint
+    icon: mdi:thermometer-plus
+    min: 0.40
+    max: 3.0
+    step: 0.05
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_auto_mode_confirmation_minutes:
+    name: Daikin auto mode confirmation
+    icon: mdi:timer-check-outline
+    min: 3
+    max: 30
+    step: 1
+    unit_of_measurement: min
+    mode: box
+
+  daikin_coil_dry_minutes:
+    name: Daikin post-cooling coil dry
+    icon: mdi:fan-clock
+    min: 15
+    max: 60
+    step: 5
+    unit_of_measurement: min
+    mode: box
+
+  daikin_minimum_on_minutes:
+    name: Daikin minimum system runtime
+    icon: mdi:timer-play-outline
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: min
+    mode: box
+
+  daikin_minimum_off_minutes:
+    name: Daikin minimum system off time
+    icon: mdi:timer-stop-outline
+    min: 0
+    max: 120
+    step: 5
+    unit_of_measurement: min
+    mode: box
+
+  daikin_humidity_target:
+    name: Daikin drying humidity target
+    icon: mdi:water-percent
+    min: 35
+    max: 75
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+
+  daikin_humidity_on_delta:
+    name: Daikin drying start above humidity target
+    icon: mdi:water-plus
+    min: 1
+    max: 15
+    step: 1
+    unit_of_measurement: "% points"
+    mode: box
+
+  daikin_dry_temperature_margin:
+    name: Daikin drying temperature start margin
+    icon: mdi:thermometer-check
+    min: 0
+    max: 2.0
+    step: 0.05
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_cool_assist_on_delta:
+    name: Daikin cooling second unit on delta
+    icon: mdi:snowflake-plus
+    min: 0.1
+    max: 3.0
+    step: 0.05
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_cool_assist_off_delta:
+    name: Daikin cooling second unit off delta
+    icon: mdi:snowflake-minus
+    min: 0
+    max: 2.0
+    step: 0.05
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_dual_assist_on_below:
+    name: Daikin dual assistance on below
+    icon: mdi:snowflake-thermometer
+    min: -20
+    max: 15
+    step: 0.1
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_dual_assist_off_above:
+    name: Daikin dual assistance off above
+    icon: mdi:thermometer-chevron-up
+    min: -19
+    max: 20
+    step: 0.1
+    unit_of_measurement: °C
+    mode: box
+
+  daikin_dual_total_step_limit:
+    name: Daikin dual total demand step limit
+    icon: mdi:stairs
+    min: 1
+    max: 40
+    step: 1
+    unit_of_measurement: "% points"
+    mode: slider
+
+  daikin_dual_episode_minutes:
+    name: Daikin dual optimizer episode
+    icon: mdi:timer-sand
+    min: 30
+    max: 240
+    step: 15
+    unit_of_measurement: min
+    mode: box
+
+  daikin_dual_abort_error:
+    name: Daikin dual optimizer comfort abort
+    icon: mdi:alert-thermometer
+    min: 0.2
+    max: 2.0
+    step: 0.05
+    unit_of_measurement: °C
+    mode: box

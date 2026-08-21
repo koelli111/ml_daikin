@@ -1,0 +1,98 @@
+# Independent Home Assistant watchdog for daikin_ml_multi.py.
+#
+# Both configured climate entities match daikin_ml_multi_config.py.
+# This automation intentionally does not call Pyscript services. It is
+# alert-only: controller, heartbeat, sensor and command anomalies never cause
+# this watchdog to change either climate entity.
+
+group:
+  daikin_watchdog_climates:
+    name: Daikin watchdog climates
+    entities:
+      - climate.faikin_mqtt_hvac
+      - climate.94a9903980ec_mqtt_hvac
+
+template:
+  - binary_sensor:
+      - name: Daikin controller heartbeat stale
+        unique_id: daikin_controller_heartbeat_stale
+        device_class: problem
+        state: >-
+          {% set heartbeat = states('sensor.daikin_dual_controller_heartbeat') | float(0) %}
+          {% set timeout = states('input_number.daikin_watchdog_timeout_minutes') | float(4) * 60 %}
+          {{ is_state('input_boolean.daikin_watchdog_enabled', 'on') and
+             (heartbeat <= 0 or as_timestamp(now()) - heartbeat > timeout) }}
+        attributes:
+          heartbeat_age_seconds: >-
+            {% set heartbeat = states('sensor.daikin_dual_controller_heartbeat') | float(0) %}
+            {{ (as_timestamp(now()) - heartbeat) | round(1) if heartbeat > 0 else none }}
+          timeout_seconds: >-
+            {{ (states('input_number.daikin_watchdog_timeout_minutes') | float(4) * 60) | round(0) }}
+
+      - name: Daikin controller safety trip
+        unique_id: daikin_controller_safety_trip
+        device_class: problem
+        state: >-
+          {{ is_state('input_boolean.daikin_watchdog_enabled', 'on') and
+             (is_state('binary_sensor.daikin_controller_heartbeat_stale', 'on') or
+              is_state('sensor.daikin_dual_health', 'fault') or
+              is_state('sensor.daikin_dual_command_status', 'failed')) }}
+        attributes:
+          heartbeat_stale: "{{ is_state('binary_sensor.daikin_controller_heartbeat_stale', 'on') }}"
+          controller_health: "{{ states('sensor.daikin_dual_health') }}"
+          command_status: "{{ states('sensor.daikin_dual_command_status') }}"
+          watchdog_policy: alert_only
+          shutdown_action: disabled
+
+automation:
+  - id: daikin_independent_controller_watchdog
+    alias: Daikin - independent controller watchdog
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+      - trigger: homeassistant
+        event: start
+    conditions:
+      - condition: state
+        entity_id: input_boolean.daikin_watchdog_enabled
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.daikin_controller_safety_trip
+        state: "on"
+    actions:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.daikin_watchdog_tripped
+      - action: persistent_notification.create
+        data:
+          notification_id: daikin_controller_watchdog
+          title: Daikin controller anomaly
+          message: >-
+            The independent anomaly monitor is active. Heartbeat stale:
+            {{ states('binary_sensor.daikin_controller_heartbeat_stale') }};
+            controller health: {{ states('sensor.daikin_dual_health') }};
+            command status: {{ states('sensor.daikin_dual_command_status') }}.
+            Alert-only policy is active: no HVAC mode, Demand or power state was
+            changed. Inspect sensor.daikin_dual_health,
+            sensor.daikin_dual_command_status and the Home Assistant log.
+
+  - id: daikin_independent_controller_watchdog_recovered
+    alias: Daikin - controller watchdog recovered
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.daikin_controller_safety_trip
+        to: "off"
+        for: "00:02:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.daikin_watchdog_tripped
+        state: "on"
+    actions:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.daikin_watchdog_tripped
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: daikin_controller_watchdog

@@ -1,0 +1,37 @@
+Daikin dual controller release
+Release: 2026-08-21-separate-areas-r10-r2
+Built: 2026-08-21 Europe/Helsinki
+
+Required current-release fingerprints:
+- Controller version: 2026-08-21-separate-areas-r10-r2
+- Optional input_boolean.daikin_separate_areas topology
+- Shared mode retains the Apollo default indoor sensor
+- Separate Daikin1 area sensor: sensor.faikin_ac_home
+- Separate Daikin2 area sensor: sensor.apollo_temp_1_95d874_temperature_probe
+- Independent modes, setpoints, Summer policies, PI state and minimum timers
+- Independent temperature-rate and predictive landing control
+- Independent defrost, CDP floors, safety isolation and COP/Demand learning
+- Shared lead/assist allocation and cross-unit freeze bypassed when separate
+- Graph sensor: sensor.daikin_dual_cdp_temperature_curve
+- Numeric state is current highest per-unit CDP floor
+- Per-unit graph points expose outdoor-temperature midpoint and minimum Demand
+- Per-unit, per-fan, 2 C outdoor-temperature CDP minimum curve
+- Confirmed sufficient/insufficient Demand boundary learning
+- Three-minute sustaining observation before downward learning probes
+- Conservative interpolation, low-confidence margin and 45-day confidence decay
+- Learned CDP floor is enforced as the Summer-heating minimum
+- Heating learning accepts heat/heating action or compressor-running evidence
+- Heating learning requires acknowledged physical heat mode
+- Cooling and drying learning action gates remain strict
+- CDP release confirmation: 20 s; validated downward probe cadence: 180 s
+- Last confirmed release Demand restores immediately after a failed probe
+- Lowest confirmed release Demand persists per unit across restart
+- CDP stabilization, low-airflow confirmation and Demand step cadence: 20 s
+- Configured compressor/running sensor can confirm active heating for CDP
+- Retained MQTT fan-RPM states never expire by age
+- HVAC action `heat` and `heating` both confirm physical heating
+- Heating lead selector: input_boolean.daikin1_heating_lead
+- Selector OFF: Daikin2 starts heating first
+- Selector ON: Daikin1 starts heating first
+- Shared dry demand uses physical dry mode
+- During Daikin2-only heating, Daikin1 uses fan_only at lowMedium
